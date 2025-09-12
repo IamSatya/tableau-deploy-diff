@@ -1,4 +1,4 @@
-import os, zipfile, difflib, tempfile, requests, traceback, base64
+import os, zipfile, difflib, tempfile, requests, traceback
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,7 +10,6 @@ MAX_LINES_PER_COMMENT = 1000
 
 
 def extract_twb_content(path, original_name):
-    """Extract .twb content from a .twb or .twbx file."""
     if original_name.endswith(".twb"):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -34,7 +33,6 @@ def extract_twb_content(path, original_name):
 
 
 def generate_minimal_diff(old_content, new_content):
-    """Generate simplified diff (only +, -, @@ lines)."""
     diff = difflib.unified_diff(
         old_content.splitlines(),
         new_content.splitlines(),
@@ -46,7 +44,6 @@ def generate_minimal_diff(old_content, new_content):
 
 
 def post_github_comment(owner, repo, pr_number, body):
-    """Post a comment on the PR."""
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments"
     response = requests.post(url, headers=headers, json={"body": body})
@@ -54,7 +51,6 @@ def post_github_comment(owner, repo, pr_number, body):
 
 
 def paginate_and_post_comment(owner, repo, pr_number, file_path, content, label="xml"):
-    """Split large comments and post them in parts."""
     lines = content.splitlines()
     for i in range(0, len(lines), MAX_LINES_PER_COMMENT):
         chunk = lines[i : i + MAX_LINES_PER_COMMENT]
@@ -67,25 +63,10 @@ def paginate_and_post_comment(owner, repo, pr_number, file_path, content, label=
         post_github_comment(owner, repo, pr_number, comment)
 
 
-def fetch_blob_content(owner, repo, sha):
-    """Fetch full file content from GitHub Git Data API."""
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs/{sha}"
-    r = requests.get(url, headers=headers)
-    if r.status_code == 200:
-        blob = r.json()
-        if "content" in blob and blob.get("encoding") == "base64":
-            return base64.b64decode(blob["content"])
-    else:
-        print(f"⚠️ Failed to fetch blob {sha}: {r.status_code} {r.text}")
-    return None
-
-
 def process_pull_request(owner, repo, pr_number, base_branch, head_branch):
     try:
         headers = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-        # Get list of changed files in PR
         files_url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/files"
         print(f"🔎 Fetching PR files: {files_url}")
         r_files = requests.get(files_url, headers=headers)
@@ -102,9 +83,6 @@ def process_pull_request(owner, repo, pr_number, base_branch, head_branch):
         for change in files:
             file_path = change.get("filename")
             status = change.get("status")
-            sha = change.get("sha")
-            previous_sha = change.get("previous_sha")
-
             if not file_path or not status:
                 print(f"⚠️ Skipping unexpected file entry: {change}")
                 continue
@@ -118,21 +96,33 @@ def process_pull_request(owner, repo, pr_number, base_branch, head_branch):
                 old_path = os.path.join(tmpdir, "old_file")
                 new_path = os.path.join(tmpdir, "new_file")
 
-                # Old file
-                if status != "added" and previous_sha:
-                    content = fetch_blob_content(owner, repo, previous_sha)
-                    if content:
+                # Get old file from base branch
+                if status != "added":
+                    old_url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={base_branch}"
+                    r_old = requests.get(old_url, headers=headers)
+                    if r_old.status_code == 200:
+                        import base64
+
+                        content = base64.b64decode(r_old.json()["content"])
                         with open(old_path, "wb") as f:
                             f.write(content)
                         old_xml = extract_twb_content(old_path, file_path)
+                    else:
+                        print(f"⚠️ Failed to fetch old file {file_path}: {r_old.status_code}")
 
-                # New file
-                if status != "removed" and sha:
-                    content = fetch_blob_content(owner, repo, sha)
-                    if content:
+                # Get new file from head branch
+                if status != "removed":
+                    new_url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={head_branch}"
+                    r_new = requests.get(new_url, headers=headers)
+                    if r_new.status_code == 200:
+                        import base64
+
+                        content = base64.b64decode(r_new.json()["content"])
                         with open(new_path, "wb") as f:
                             f.write(content)
                         new_xml = extract_twb_content(new_path, file_path)
+                    else:
+                        print(f"⚠️ Failed to fetch new file {file_path}: {r_new.status_code}")
 
             # Handle file statuses
             if status == "added" and new_xml:
