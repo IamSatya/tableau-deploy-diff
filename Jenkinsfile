@@ -16,10 +16,12 @@ pipeline {
     stages {
         stage('Setup') {
             steps {
-                sh 'python --version'
-                sh 'python -m venv venv'
-                sh 'source venv/bin/activate'
-                sh 'pip install requests python-dotenv'
+                sh '''
+                    python --version'
+                    python -m venv venv'
+                    source venv/bin/activate'
+                    pip install requests python-dotenv
+                '''
             }
         }
 
