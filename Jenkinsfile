@@ -17,19 +17,21 @@ pipeline {
         stage('Setup') {
             steps {
                 sh '''
+                    #!/bin/bash
                     python --version
                     python -m venv venv
                     source venv/bin/activate
                     pip install requests python-dotenv
+                    python tableau_diff_bot.py
                 '''
             }
         }
 
-        stage('Run Tableau Diff Bot') {
-            steps {
-                sh 'python tableau_diff_bot.py'
-            }
-        }
+        // stage('Run Tableau Diff Bot') {
+        //     steps {
+        //         sh 'python tableau_diff_bot.py'
+        //     }
+        // }
     }
 
     post {
