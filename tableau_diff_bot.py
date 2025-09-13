@@ -10,22 +10,57 @@ MAX_LINES_PER_COMMENT = 1000
 
 
 def extract_twb_content(path, original_name):
+    print(f"[extract] Processing {original_name}, file size: {os.path.getsize(path)} bytes")
+    
     if original_name.endswith(".twb"):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+                content = f.read()
+                print(f"[extract] Successfully read .twb file, content length: {len(content)}")
+                return content
         except Exception as e:
             print(f"[extract] Error reading .twb: {e}")
             traceback.print_exc()
     elif original_name.endswith(".twbx"):
         try:
+            print(f"[extract] Attempting to open .twbx file as ZIP: {path}")
+            
+            # Check if file exists and is readable
+            if not os.path.exists(path):
+                print(f"[extract] File does not exist: {path}")
+                return ""
+            
+            # Try to open as ZIP file
             with zipfile.ZipFile(path, "r") as z:
-                twb_files = [f for f in z.namelist() if f.endswith(".twb")]
+                file_list = z.namelist()
+                print(f"[extract] ZIP contains {len(file_list)} files: {file_list}")
+                
+                twb_files = [f for f in file_list if f.endswith(".twb")]
+                print(f"[extract] Found {len(twb_files)} .twb files: {twb_files}")
+                
                 if not twb_files:
                     print(f"[extract] No .twb file found inside {path}")
                     return ""
-                with z.open(twb_files[0]) as twb_file:
-                    return twb_file.read().decode("utf-8")
+                
+                twb_file_name = twb_files[0]
+                print(f"[extract] Reading .twb file: {twb_file_name}")
+                
+                with z.open(twb_file_name) as twb_file:
+                    content = twb_file.read().decode("utf-8")
+                    print(f"[extract] Successfully extracted .twb content, length: {len(content)}")
+                    return content
+                    
+        except zipfile.BadZipFile as e:
+            print(f"[extract] Invalid ZIP file {path}: {e}")
+            # Try to read as plain text in case it's actually a .twb file with wrong extension
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if content.strip().startswith("<?xml"):
+                        print(f"[extract] File appears to be XML despite .twbx extension")
+                        return content
+            except Exception as text_error:
+                print(f"[extract] Also failed to read as text: {text_error}")
         except Exception as e:
             print(f"[extract] Error with .twbx: {e}")
             traceback.print_exc()
