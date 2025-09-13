@@ -134,28 +134,62 @@ def process_pull_request(owner, repo, pr_number, base_branch, head_branch):
                 # Get old file from base branch
                 if status != "added":
                     old_url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={base_branch}"
+                    print(f"🔍 Fetching old file: {old_url}")
                     r_old = requests.get(old_url, headers=headers)
                     if r_old.status_code == 200:
-                        import base64
-
-                        content = base64.b64decode(r_old.json()["content"])
-                        with open(old_path, "wb") as f:
-                            f.write(content)
-                        old_xml = extract_twb_content(old_path, file_path)
+                        old_data = r_old.json()
+                        print(f"📁 Old file info: size={old_data.get('size', 'unknown')}, encoding={old_data.get('encoding', 'unknown')}")
+                        
+                        if old_data.get("encoding") == "base64":
+                            import base64
+                            content = base64.b64decode(old_data["content"])
+                            print(f"📦 Decoded old file, size: {len(content)} bytes")
+                            with open(old_path, "wb") as f:
+                                f.write(content)
+                            old_xml = extract_twb_content(old_path, file_path)
+                        elif "download_url" in old_data:
+                            # Large files have download_url instead of content
+                            print(f"📥 Large file detected, using download_url: {old_data['download_url']}")
+                            r_download = requests.get(old_data["download_url"], headers=headers)
+                            if r_download.status_code == 200:
+                                with open(old_path, "wb") as f:
+                                    f.write(r_download.content)
+                                old_xml = extract_twb_content(old_path, file_path)
+                            else:
+                                print(f"❌ Failed to download old file: {r_download.status_code}")
+                        else:
+                            print(f"⚠️ Unexpected old file format: {old_data}")
                     else:
                         print(f"⚠️ Failed to fetch old file {file_path}: {r_old.status_code}")
 
                 # Get new file from head branch
                 if status != "removed":
                     new_url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={head_branch}"
+                    print(f"🔍 Fetching new file: {new_url}")
                     r_new = requests.get(new_url, headers=headers)
                     if r_new.status_code == 200:
-                        import base64
-
-                        content = base64.b64decode(r_new.json()["content"])
-                        with open(new_path, "wb") as f:
-                            f.write(content)
-                        new_xml = extract_twb_content(new_path, file_path)
+                        new_data = r_new.json()
+                        print(f"📁 New file info: size={new_data.get('size', 'unknown')}, encoding={new_data.get('encoding', 'unknown')}")
+                        
+                        if new_data.get("encoding") == "base64":
+                            import base64
+                            content = base64.b64decode(new_data["content"])
+                            print(f"📦 Decoded new file, size: {len(content)} bytes")
+                            with open(new_path, "wb") as f:
+                                f.write(content)
+                            new_xml = extract_twb_content(new_path, file_path)
+                        elif "download_url" in new_data:
+                            # Large files have download_url instead of content
+                            print(f"📥 Large file detected, using download_url: {new_data['download_url']}")
+                            r_download = requests.get(new_data["download_url"], headers=headers)
+                            if r_download.status_code == 200:
+                                with open(new_path, "wb") as f:
+                                    f.write(r_download.content)
+                                new_xml = extract_twb_content(new_path, file_path)
+                            else:
+                                print(f"❌ Failed to download new file: {r_download.status_code}")
+                        else:
+                            print(f"⚠️ Unexpected new file format: {new_data}")
                     else:
                         print(f"⚠️ Failed to fetch new file {file_path}: {r_new.status_code}")
 
