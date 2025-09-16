@@ -1,15 +1,9 @@
-// Jenkinsfile (multibranch) - uses usernamePassword credential for GitHub PAT
-// - PR builds run the diff bot (dry-run).
-// - main branch build auto-deploys only when the merge commit is from a merged prod->main PR.
-// - Uses GenericTrigger for webhook payload mapping.
-// Credentials:
-//   - github-token : Username with password (password = GitHub PAT)
-//   - tableau-cred : Username with password (Tableau username/password)
-
+// Jenkinsfile (multibranch) - fixed: inject OWNER/REPO/HEAD/BASE/PR envs for PR runs
 pipeline {
   agent any
 
   triggers {
+    // keep GenericTrigger if you still want webhook-based runs; for multibranch PR jobs GitHub Branch Source is used.
     GenericTrigger(
       genericVariables: [
         [key: 'OWNER',       value: '$.repository.owner.login'],
@@ -50,6 +44,7 @@ pipeline {
     stage('Prepare Environment') {
       steps {
         sh '''
+          # create venv and install deps
           python3 -m venv .venv || python -m venv .venv
           . .venv/bin/activate
           pip install --upgrade pip
@@ -64,31 +59,60 @@ pipeline {
       }
       steps {
         script {
-          // Only run diffs for PRs (we're only interested in prod -> main PRs and prod-targeted PRs)
           echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot (dry-run)."
 
-          // Bind GitHub PAT (stored as username/password) and Tableau creds
+          // Build OWNER/REPO from git remote if not provided via webhook (multibranch builds typically don't have them)
+          def ownerRepo = sh(script: "git config --get remote.origin.url | sed -E 's#.*[:/](.+)/(.+)\\.git\$#\\1/\\2#' || true", returnStdout: true).trim()
+          if (!ownerRepo) {
+            // fallback: try parsing GIT_URL env or repository info
+            ownerRepo = "${env.OWNER ?: ''}/${env.REPO ?: ''}"
+            ownerRepo = ownerRepo.trim().replaceAll('^/','').replaceAll('/$','')
+          }
+          if (!ownerRepo || ownerRepo == '/') {
+            echo "WARNING: Could not determine owner/repo from git remote or webhook. OWNER/REPO will be empty unless webhook provided them."
+          } else {
+            echo "Determined owner/repo: ${ownerRepo}"
+          }
+          def owner = ownerRepo.tokenize('/').size() >= 2 ? ownerRepo.tokenize('/')[0] : ''
+          def repo  = ownerRepo.tokenize('/').size() >= 2 ? ownerRepo.tokenize('/')[1] : ''
+
+          // Map PR-specific envs from multibranch vars (CHANGE_*)
+          def prNumber = env.CHANGE_ID ?: env.PR_NUMBER ?: ''
+          def headBranch = env.CHANGE_BRANCH ?: env.HEAD_BRANCH ?: ''
+          def baseBranch = env.CHANGE_TARGET ?: env.BASE_BRANCH ?: ''
+
+          if (!prNumber) {
+            error "PR number not available (CHANGE_ID/PR_NUMBER). Aborting PR diff stage."
+          }
+
+          echo "PR envs: OWNER='${owner}', REPO='${repo}', PR_NUMBER='${prNumber}', HEAD_BRANCH='${headBranch}', BASE_BRANCH='${baseBranch}'"
+
+          // Bind creds and run diff bot
           withCredentials([
             usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
-            sh '''
+            // Export variables and call the Python diff bot
+            sh """
+              set -euo pipefail
               . .venv/bin/activate
-              export GITHUB_USER="${GITHUB_USER}"
-              export GITHUB_TOKEN="${GITHUB_TOKEN}"
-              export TABLEAU_USER="${TABLEAU_USER}"
-              export TABLEAU_PW="${TABLEAU_PW}"
-              export DRY_RUN="${DRY_RUN_DEFAULT}"
-              export PR_NUMBER="${CHANGE_ID}"
-              export PR_SOURCE_BRANCH="${CHANGE_BRANCH}"
-              export PR_TARGET_BRANCH="${CHANGE_TARGET}"
-              echo "Running ${TABLEAU_DIFF_PY}..."
+              export GITHUB_USER='${GITHUB_USER}'
+              export GITHUB_TOKEN='${GITHUB_TOKEN}'
+              export TABLEAU_USER='${TABLEAU_USER}'
+              export TABLEAU_PW='${TABLEAU_PW}'
+              export DRY_RUN='${DRY_RUN_DEFAULT}'
+              export PR_NUMBER='${prNumber}'
+              export PR_SOURCE_BRANCH='${headBranch}'
+              export PR_TARGET_BRANCH='${baseBranch}'
+              export OWNER='${owner}'
+              export REPO='${repo}'
+              echo "Invoking ${TABLEAU_DIFF_PY} with OWNER=${owner}, REPO=${repo}, PR_NUMBER=${prNumber}, HEAD=${headBranch}, BASE=${baseBranch}"
               python "${TABLEAU_DIFF_PY}"
-            '''
-          }
-        }
-      }
-    }
+            """
+          } // withCredentials
+        } // script
+      } // steps
+    } // stage PR
 
     stage('Deploy to Tableau (main - automatic on prod->main PR merge)') {
       when {
@@ -99,23 +123,22 @@ pipeline {
       }
       steps {
         script {
-          // Determine OWNER/REPO from git remote origin
-          def ownerRepo = sh(script: "git config --get remote.origin.url | sed -E 's#.*[:/](.+)/(.+)\\.git\$#\\1/\\2#'", returnStdout: true).trim()
+          echo "Main branch build detected. Checking if this commit is from a merged prod->main PR..."
+
+          // Determine owner/repo
+          def ownerRepo = sh(script: "git config --get remote.origin.url | sed -E 's#.*[:/](.+)/(.+)\\.git\$#\\1/\\2#' || true", returnStdout: true).trim()
           if (!ownerRepo) {
             error "Unable to determine owner/repo from git remote. Aborting deploy."
           }
           def (owner, repo) = ownerRepo.tokenize('/')
 
-          // Get current commit SHA
           def sha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
           echo "Main commit ${sha} - querying GitHub for PRs associated with this commit..."
 
-          // Use usernamePassword to supply GitHub PAT (password) and Tableau creds
           withCredentials([
             usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
-            // Query GitHub API for PRs linked to this commit
             def apiCmd = """curl -s -H "Accept: application/vnd.github.groot-preview+json" \
  -H "Authorization: token ${GITHUB_TOKEN}" \
  "https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls" """
@@ -125,7 +148,6 @@ pipeline {
               error "GitHub API: empty response for commit ${sha}. Aborting deploy."
             }
 
-            // Find a merged PR whose head.ref == "prod"
             def prNumber = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .number' | head -n1", returnStdout: true).trim()
             def prTitle  = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .title' | head -n1", returnStdout: true).trim()
             def prUser   = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .user.login' | head -n1", returnStdout: true).trim()
@@ -137,7 +159,6 @@ pipeline {
             echo "Found merged PR #${prNumber} (title: ${prTitle}, author: ${prUser}) associated with commit ${sha}."
             echo "Proceeding automatically to deploy (no manual approval)."
 
-            // Execute the Tableau sync script (real deploy)
             sh """
               chmod +x "${TABLEAU_SYNC_SCRIPT}" || true
               export TABLEAU_USER="${TABLEAU_USER}"
