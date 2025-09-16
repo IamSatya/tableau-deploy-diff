@@ -2,13 +2,7 @@
 """
 Tableau diff bot — post full diffs split across multiple PR comments (no gist).
 Colorized: added lines show green (+), removed lines show red (-).
-
-Behavior:
-- Extract .twb/.twbx, normalize, compute minimal diffs.
-- Build one aggregated set of sections (one per file).
-- Split sections into sub-chunks and pack into comment bodies of <= SAFE_COMMENT_CHARS chars.
-- Delete previous bot-managed aggregated comments (SEARCHABLE_PR_TAG) and post the new chunked comments.
-- If posting aggregated comments fails with 422, fall back to posting per-file comments (also chunked).
+Safe-splitting: never breaks code fences; large code blocks are split into multiple fenced chunks.
 """
 import os
 import re
@@ -28,7 +22,6 @@ import difflib
 from dotenv import load_dotenv
 import html
 import json
-import math
 
 load_dotenv()
 
@@ -50,17 +43,14 @@ EXTRACTION_MAX_RETRIES = int(os.getenv("EXTRACTION_MAX_RETRIES", "4"))
 EXTRACTION_BACKOFF_FACTOR = float(os.getenv("EXTRACTION_BACKOFF_FACTOR", "2"))
 
 # Comment splitting config
-# GitHub hard limit ~65536; use SAFE_COMMENT_CHARS slightly lower by default
 SAFE_COMMENT_CHARS = int(os.getenv("SAFE_COMMENT_CHARS", "65000"))
 
 # Keep optional per-file separate comments (true/false)
 CREATE_PER_FILE_COMMENTS = os.getenv("CREATE_PER_FILE_COMMENTS", "false").lower() in ("1","true","yes")
 
-GIST_PUBLIC = os.getenv("GIST_PUBLIC", "false").lower() in ("1","true","yes")  # not used (kept for compatibility)
-
 # logging
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("tableau-diff-split-chunker")
+logger = logging.getLogger("tableau-diff-safe-splitter")
 
 if not GITHUB_TOKEN:
     logger.error("GITHUB_TOKEN is not set. Exiting.")
@@ -120,26 +110,6 @@ def _should_delay_before_extract(path: str) -> bool:
         return False
 
 
-def extract_twb_content_with_retries(path: str, original_name: str) -> str:
-    attempt = 0
-    delay = EXTRACTION_INITIAL_DELAY_SEC if _should_delay_before_extract(path) else 0
-    while attempt <= EXTRACTION_MAX_RETRIES:
-        if delay > 0:
-            logger.info(f"Delaying {delay}s before extraction attempt {attempt+1} for {original_name}")
-            time.sleep(delay)
-        try:
-            content = _extract_twb_content(path, original_name)
-            if content:
-                return content
-            logger.warning(f"Extraction returned empty on attempt {attempt+1} for {original_name}")
-        except Exception as e:
-            logger.warning(f"Extraction attempt {attempt+1} failed for {original_name}: {e}")
-        attempt += 1
-        delay = delay * EXTRACTION_BACKOFF_FACTOR if delay > 0 else 0
-    logger.error(f"All extraction attempts failed for {original_name}")
-    return ""
-
-
 def _extract_twb_content(path: str, original_name: str) -> str:
     logger.info(f"[extract] Processing {original_name}; exists={Path(path).exists()}")
     try:
@@ -183,11 +153,28 @@ def _extract_twb_content(path: str, original_name: str) -> str:
     return ""
 
 
+def extract_twb_content_with_retries(path: str, original_name: str) -> str:
+    attempt = 0
+    delay = EXTRACTION_INITIAL_DELAY_SEC if _should_delay_before_extract(path) else 0
+    while attempt <= EXTRACTION_MAX_RETRIES:
+        if delay > 0:
+            logger.info(f"Delaying {delay}s before extraction attempt {attempt+1} for {original_name}")
+            time.sleep(delay)
+        try:
+            content = _extract_twb_content(path, original_name)
+            if content:
+                return content
+            logger.warning(f"Extraction returned empty on attempt {attempt+1} for {original_name}")
+        except Exception as e:
+            logger.warning(f"Extraction attempt {attempt+1} failed for {original_name}: {e}")
+        attempt += 1
+        delay = delay * EXTRACTION_BACKOFF_FACTOR if delay > 0 else 0
+    logger.error(f"All extraction attempts failed for {original_name}")
+    return ""
+
+
+# ---------- Diff generation (full unified diff) ----------
 def generate_minimal_diff(old_content: str, new_content: str) -> List[str]:
-    """
-    Produce a proper unified diff (full lines, including context lines that start with ' ').
-    Returning full unified diff helps GitHub render colorized diffs reliably.
-    """
     old_lines = normalize_xml_for_diff(old_content).splitlines()
     new_lines = normalize_xml_for_diff(new_content).splitlines()
     diff_iter = difflib.unified_diff(
@@ -197,7 +184,6 @@ def generate_minimal_diff(old_content: str, new_content: str) -> List[str]:
         tofile="new.twb",
         lineterm=""
     )
-    # keep all lines (context ' ', additions '+', deletions '-', hunks '@@')
     return [line for line in diff_iter]
 
 
@@ -253,7 +239,7 @@ def _list_bot_pr_comments(owner: str, repo: str, pr_number: str, pr_tag: str) ->
 
 
 def _delete_comment(owner: str, repo: str, comment_id: int) -> bool:
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/comments/{comment_id}"
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{comment_id}"
     r = session.delete(url, timeout=REQUEST_TIMEOUT)
     if r.status_code in (204,):
         logger.info(f"Deleted old bot comment id={comment_id}")
@@ -334,6 +320,8 @@ def fetch_pr_files(owner: str, repo: str, pr_number: str) -> List[dict]:
         page += 1
     return results
 
+
+# ---------- Build file section (colorized add/remove) ----------
 def build_file_section(summary: Dict, pr_number: str) -> str:
     """
     Build a markdown section for one file. For added/removed files we
@@ -394,7 +382,18 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
             parts.append("✅ No meaningful changes detected.\n\n")
         else:
             # clean any stray BOM/CR in diff lines and ensure no HTML-escaping
-            cleaned = [clean_line(ln) for ln in diff_lines]
+            cleaned = [ln[1:] and ln for ln in [l.rstrip("\r") for l in diff_lines]]  # minimal pass to preserve leading +/-/space/@
+
+            # fallback if that odd construct produced wrong results: use a safer clean
+            cleaned = [ (l[1:] and l) or l for l in [l.rstrip("\r") for l in diff_lines] ]
+
+            # actually, simpler: just strip \r and BOM, keep content unchanged
+            cleaned = []
+            for l in diff_lines:
+                if l and l[0] == "\ufeff":
+                    l = l[1:]
+                cleaned.append(l.rstrip("\r"))
+
             total = (len(cleaned) - 1) // MAX_LINES_PER_SECTION + 1
             for i in range(0, len(cleaned), MAX_LINES_PER_SECTION):
                 chunk = cleaned[i: i + MAX_LINES_PER_SECTION]
@@ -415,7 +414,7 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
     return "\n".join(parts)
 
 
-# ---------- Splitting utilities ----------
+# ---------- Splitting utilities that preserve fences ----------
 def split_into_chunks(text: str, max_chars: int) -> List[str]:
     """
     Split a long text into multiple chunks of <= max_chars.
@@ -431,44 +430,90 @@ def split_into_chunks(text: str, max_chars: int) -> List[str]:
     while start < N:
         end = min(start + max_chars, N)
         if end < N:
-            # try to back up to last newline to keep chunks clean
             nl = text.rfind("\n", start, end)
             if nl > start:
-                end = nl + 1  # include newline
+                end = nl + 1
         chunk = text[start:end]
         chunks.append(chunk)
         start = end
     return chunks
 
 
+def _split_code_block_by_chars(code_text: str, max_code_chars: int) -> List[str]:
+    """
+    Split code_text (the interior of a code fence) into newline-respecting chunks
+    each with length <= max_code_chars (approx). Returns list of code-only chunks.
+    """
+    if not code_text:
+        return []
+    lines = code_text.splitlines()
+    chunks = []
+    cur_lines = []
+    cur_len = 0
+    for ln in lines:
+        to_add = len(ln) + 1
+        if cur_lines and cur_len + to_add > max_code_chars:
+            chunks.append("\n".join(cur_lines))
+            cur_lines = [ln]
+            cur_len = to_add
+        else:
+            cur_lines.append(ln)
+            cur_len += to_add
+    if cur_lines:
+        chunks.append("\n".join(cur_lines))
+    return chunks
+
+
+def split_section_preserve_fences(section: str, max_chars: int) -> List[str]:
+    """
+    Break a section into safe sub-parts that don't break fenced blocks.
+    - Finds ```diff\n ... \n``` blocks and splits them internally if needed.
+    - Splits non-code text on newline boundaries using split_into_chunks behavior.
+    Returns list of pieces suitable to be appended to comment bodies.
+    """
+    if not section:
+        return []
+    pieces: List[str] = []
+    # pattern catches ```diff\n ... \n``` ; DOTALL to include newlines
+    fence_pat = re.compile(r'```diff\n(.*?)\n```', re.DOTALL)
+    last = 0
+    for m in fence_pat.finditer(section):
+        pre = section[last:m.start()]
+        if pre:
+            pieces.extend(split_into_chunks(pre, max_chars))
+        code_inner = m.group(1)
+        overhead = len("```diff\n\n```\n")
+        max_code_chars = max(200, max_chars - overhead - 200)
+        code_chunks = _split_code_block_by_chars(code_inner, max_code_chars)
+        for cc in code_chunks:
+            fenced = "```diff\n" + cc + "\n```"
+            pieces.append(fenced)
+        last = m.end()
+    tail = section[last:]
+    if tail:
+        pieces.extend(split_into_chunks(tail, max_chars))
+    return pieces
+
+
 def pack_sections_to_comment_bodies(header_tag: str, intro: str, sections: List[str], max_chars: int) -> List[str]:
     """
-    Pack list of sections (each may be long) into sequential comment bodies, each <= max_chars.
-    Each section may be split into internal sub-chunks using split_into_chunks.
-    Returns list of comment bodies.
+    Pack list of sections into comment bodies without breaking fenced code blocks.
+    Uses split_section_preserve_fences to ensure safe splitting.
     """
     bodies: List[str] = []
     current = header_tag + "\n\n" + intro + "\n"
     for section in sections:
-        # If section fits, try to append to current.
-        if len(section) <= max_chars:
-            if len(current) + len(section) <= max_chars:
-                current += section
+        safe_parts = split_section_preserve_fences(section, max_chars)
+        for part in safe_parts:
+            # ensure no leading spaces before a fence
+            part = re.sub(r'^\s+```', '```', part, flags=re.MULTILINE)
+            if len(current) + len(part) <= max_chars:
+                current += part
             else:
                 bodies.append(current)
-                current = header_tag + "\n\n" + intro + "\n" + section
-        else:
-            # section is larger than max_chars: split into sub-chunks and append each one (attempt to pack multiple small ones)
-            sub_chunks = split_into_chunks(section, max_chars - len(header_tag) - 200)  # leave space for header & part text
-            for sc in sub_chunks:
-                if len(current) + len(sc) <= max_chars:
-                    current += sc
-                else:
-                    bodies.append(current)
-                    current = header_tag + "\n\n" + intro + "\n" + sc
+                current = header_tag + "\n\n" + intro + "\n" + part
     if current.strip():
         bodies.append(current)
-    # annotate final body with tip
     if bodies:
         bodies[-1] += f"\n\n*Tip:* Search for the tag `{header_tag}` to find these comments."
     return bodies
@@ -479,12 +524,10 @@ def _fallback_post_per_file_and_summary(owner: str, repo: str, pr_number: str, p
     logger.info("Fallback: posting per-file chunked comments and short PR summary")
     for s in file_summaries:
         section = build_file_section(s, pr_number)
-        # split section into chunks and post each as its own comment part
-        chunks = split_into_chunks(section, SAFE_COMMENT_CHARS)
+        chunks = split_section_preserve_fences(section, SAFE_COMMENT_CHARS)
         for i, c in enumerate(chunks, start=1):
             part_header = f"#tableau-file {s['file_path']} — Part {i}/{len(chunks)}"
-            body = c.replace(f"**{html.escape(s['file_path'])}**", f"**{html.escape(s['file_path'])}**")  # keep same
-            # ensure tag present
+            body = c
             if "#tableau-file" not in body:
                 body = part_header + "\n\n" + body
             try:
@@ -493,7 +536,6 @@ def _fallback_post_per_file_and_summary(owner: str, repo: str, pr_number: str, p
                 logger.exception(f"Failed posting fallback per-file chunk for {s['file_path']}")
             time.sleep(0.3)
 
-    # tiny PR summary
     summary_lines = []
     for s in file_summaries:
         first_preview = (s.get('preview') or '').splitlines()[0] if s.get('preview') else '(no preview)'
@@ -632,7 +674,7 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
         if CREATE_PER_FILE_COMMENTS:
             for s in file_summaries:
                 section = build_file_section(s, pr_number)
-                chunks = split_into_chunks(section, SAFE_COMMENT_CHARS)
+                chunks = split_section_preserve_fences(section, SAFE_COMMENT_CHARS)
                 for i, c in enumerate(chunks, start=1):
                     part_header = f"#tableau-file {s['file_path']} — Part {i}/{len(chunks)}"
                     body = c
@@ -652,7 +694,7 @@ def main():
     head_branch = os.getenv("HEAD_BRANCH")
     base_branch = os.getenv("BASE_BRANCH")
 
-    logger.info(f"Starting chunked-post bot for {owner}/{repo} PR {pr_number}")
+    logger.info(f"Starting safe-split bot for {owner}/{repo} PR {pr_number}")
 
     if not all([owner, repo, pr_number, head_branch, base_branch]):
         logger.error("Missing required environment variables: OWNER, REPO, PR_NUMBER, HEAD_BRANCH, BASE_BRANCH")
