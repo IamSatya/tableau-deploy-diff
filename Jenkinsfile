@@ -79,7 +79,7 @@ pipeline {
                   . .venv/bin/activate
                 fi
 
-                # Derive owner/repo robustly:
+                # Derive owner/repo robustly without using sed escapes:
                 # handles:
                 #   git@github.com:owner/repo.git
                 #   https://github.com/owner/repo.git
@@ -88,8 +88,8 @@ pipeline {
                 OWNER=""
                 REPO=""
                 if [ -n "$GIT_URL" ]; then
-                  # strip trailing .git
-                  CLEAN_URL="$(echo "$GIT_URL" | sed -E 's#\.git$##')"
+                  # remove trailing .git using bash parameter expansion (no backslashes)
+                  CLEAN_URL="${GIT_URL%.git}"
                   # split on ":" or "/" and take last two tokens using awk
                   OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' '{print $(NF-1)\"/\"$NF}')"
                   if [ -n "$OWNER_REPO" ] && [ "$(echo "$OWNER_REPO" | awk -F'/' '{print NF}')" -ge 2 ]; then
@@ -98,7 +98,7 @@ pipeline {
                   fi
                 fi
 
-                # fallback to webhook-provided envs if any (GenericTrigger) - these may be empty
+                # fallback to webhook-provided envs if any (GenericTrigger)
                 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
                   OWNER="${OWNER:-$OWNER_FROM_WEBHOOK}"
                   REPO="${REPO:-$REPO_FROM_WEBHOOK}"
@@ -144,14 +144,14 @@ pipeline {
               bash -lc '
                 set -euo pipefail
 
-                # Derive owner/repo (robust method)
+                # Derive owner/repo (robust method, no sed backslashes)
                 GIT_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
                 if [ -z "$GIT_URL" ]; then
                   echo "ERROR: cannot determine git remote URL to call GitHub API."
                   exit 1
                 fi
-                CLEAN_URL="$(echo "$GIT_URL" | sed -E "s#\\.git$##")"
-                OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' "{print \$(NF-1)\"/\"\$NF}")"
+                CLEAN_URL="${GIT_URL%.git}"
+                OWNER_REPO="$(echo "$CLEAN_URL" | awk -F"[:/]" "{print \$(NF-1)\"/\"\$NF}")"
                 OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
                 REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
 
