@@ -1,8 +1,7 @@
-// Jenkinsfile - multibranch-friendly for PR diff + automatic prod->main deploy
+// Jenkinsfile - multibranch-friendly (patched robust owner/repo parsing)
 pipeline {
   agent any
 
-  // GenericTrigger kept for webhook-based triggers; multibranch branch source will also create PR jobs.
   triggers {
     GenericTrigger(
       genericVariables: [
@@ -45,7 +44,6 @@ pipeline {
         sh '''
           bash -lc '
             set -euo pipefail
-            # create venv & install deps (if needed)
             if [ ! -d .venv ]; then
               python3 -m venv .venv || python -m venv .venv
             fi
@@ -73,7 +71,6 @@ pipeline {
             usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
-            // run everything under bash -lc so pipefail works and secrets are read from env
             sh '''
               bash -lc '
                 set -euo pipefail
@@ -83,16 +80,35 @@ pipeline {
                   . .venv/bin/activate
                 fi
 
-                # Derive owner/repo from git remote (works for typical https/ssh remotes)
-                OWNER_REPO="$(git config --get remote.origin.url | sed -E "s#.*[:/](.+)/(.+)\\.git$#\\1/\\2#" || true)"
-                if [ -z "$OWNER_REPO" ]; then
-                  echo "WARNING: Could not derive OWNER/REPO from git remote; attempting to use webhook-mapped envs"
-                  OWNER="${OWNER:-}"
-                  REPO="${REPO:-}"
-                else
-                  OWNER="$(echo $OWNER_REPO | cut -d/ -f1)"
-                  REPO="$(echo $OWNER_REPO | cut -d/ -f2)"
+                # Robust owner/repo derivation:
+                # - handle git@github.com:owner/repo.git
+                # - handle https://github.com/owner/repo.git
+                # - handle ssh://git@github.com/owner/repo.git
+                # We transform separators ":" and "/" to spaces and pick the last two tokens.
+                GIT_URL="$(git config --get remote.origin.url || true)"
+                OWNER=""
+                REPO=""
+                if [ -n "$GIT_URL" ]; then
+                  # remove trailing .git if present
+                  GIT_URL="${GIT_URL%.git}"
+                  # replace ':' and '/' with space, then take last two fields
+                  # use 'set --' to populate positional params robustly
+                  IFS=' ' read -r -a parts <<< "$(echo "$GIT_URL" | tr '/:' ' ')"
+                  len=${#parts[@]}
+                  if [ "$len" -ge 2 ]; then
+                    OWNER="${parts[$((len-2))]}"
+                    REPO="${parts[$((len-1))]}"
+                  fi
                 fi
+
+                if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
+                  echo "WARNING: Could not derive OWNER/REPO from git remote; falling back to webhook-provided envs if any"
+                  # if webhook provided OWNER/REPO envs (GenericTrigger), respect them
+                  OWNER="${OWNER:-$OWNER_FROM_WEBHOOK}"
+                  REPO="${REPO:-$REPO_FROM_WEBHOOK}"
+                fi
+
+                echo "Derived OWNER='$OWNER' REPO='$REPO' from git remote."
 
                 # Map Jenkins multibranch CHANGE_* envs into variables expected by python bot
                 export PR_NUMBER="${CHANGE_ID}"
@@ -104,8 +120,7 @@ pipeline {
 
                 echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER} (head=${PR_SOURCE_BRANCH} base=${PR_TARGET_BRANCH})"
 
-                # secrets from withCredentials already exposed as env: GITHUB_USER, GITHUB_TOKEN, TABLEAU_USER, TABLEAU_PW
-                # Call python diff bot
+                # Call python diff bot (secrets available in env via withCredentials)
                 python "${TABLEAU_DIFF_PY}"
               '
             '''
@@ -118,7 +133,7 @@ pipeline {
       when {
         allOf {
           expression { return env.BRANCH_NAME == 'main' }
-          expression { return env.CHANGE_ID == null || env.CHANGE_ID == '' } // ensure not a PR job
+          expression { return env.CHANGE_ID == null || env.CHANGE_ID == '' }
         }
       }
       steps {
@@ -133,40 +148,39 @@ pipeline {
               bash -lc '
                 set -euo pipefail
 
-                # Derive owner/repo from git remote
-                OWNER_REPO="$(git config --get remote.origin.url | sed -E "s#.*[:/](.+)/(.+)\\.git$#\\1/\\2#" || true)"
-                if [ -z "$OWNER_REPO" ]; then
-                  echo "ERROR: Cannot determine owner/repo from git remote. Aborting deploy."
+                # Derive owner/repo (same robust method)
+                GIT_URL="$(git config --get remote.origin.url || true)"
+                GIT_URL="${GIT_URL%.git}"
+                IFS=" " read -r -a parts <<< "$(echo "$GIT_URL" | tr "/:" " ")"
+                len=${#parts[@]}
+                if [ "$len" -ge 2 ]; then
+                  OWNER="${parts[$((len-2))]}"
+                  REPO="${parts[$((len-1))]}"
+                else
+                  echo "ERROR: Unable to determine owner/repo from git remote."
                   exit 1
                 fi
-                OWNER="$(echo $OWNER_REPO | cut -d/ -f1)"
-                REPO="$(echo $OWNER_REPO | cut -d/ -f2)"
 
-                # current commit
                 SHA="$(git rev-parse HEAD)"
                 echo "Querying GitHub for PRs linked to commit $SHA..."
 
-                # Use GitHub API to list PRs for commit; requires PAT in GITHUB_TOKEN
-                PRS_JSON="$(curl -s -H \"Accept: application/vnd.github.groot-preview+json\" -H \"Authorization: token ${GITHUB_TOKEN}\" \"https://api.github.com/repos/${OWNER}/${REPO}/commits/${SHA}/pulls\")"
-
-                if [ -z \"$PRS_JSON\" ] || [ \"$PRS_JSON\" = \"null\" ]; then
+                PRS_JSON="$(curl -s -H "Accept: application/vnd.github.groot-preview+json" -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER}/${REPO}/commits/${SHA}/pulls")"
+                if [ -z "$PRS_JSON" ] || [ "$PRS_JSON" = "null" ]; then
                   echo "ERROR: Empty response from GitHub for commit PR list. Aborting."
                   exit 1
                 fi
 
-                # find merged PR where head.ref == prod
-                PR_NUMBER="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .number' | head -n1 || true)"
-                PR_TITLE="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .title' | head -n1 || true)"
-                PR_USER="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .user.login' | head -n1 || true)"
+                PR_NUMBER="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .number' | head -n1 || true)"
+                PR_TITLE="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .title' | head -n1 || true)"
+                PR_USER="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .user.login' | head -n1 || true)"
 
-                if [ -z \"$PR_NUMBER\" ] || [ \"$PR_NUMBER\" = \"null\" ]; then
+                if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
                   echo "No merged prod->main PR found for commit $SHA. Skipping deployment."
                   exit 0
                 fi
 
                 echo "Found merged PR #${PR_NUMBER} (title: ${PR_TITLE}, author: ${PR_USER}). Proceeding to deploy."
 
-                # Run the Tableau sync script (real deploy)
                 if [ -f "${TABLEAU_SYNC_SCRIPT}" ]; then
                   chmod +x "${TABLEAU_SYNC_SCRIPT}" || true
                   export TABLEAU_USER="${TABLEAU_USER}"
