@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Tableau diff bot — post full diffs split across multiple PR comments (no gist).
+Colorized: added lines show green (+), removed lines show red (-).
 
 Behavior:
 - Extract .twb/.twbx, normalize, compute minimal diffs.
@@ -324,7 +325,7 @@ def fetch_pr_files(owner: str, repo: str, pr_number: str) -> List[dict]:
     return results
 
 
-# ---------- Build file section ----------
+# ---------- Build file section (colorized add/remove) ----------
 def build_file_section(summary: Dict, pr_number: str) -> str:
     fp = html.escape(summary["file_path"])
     status = summary["status"]
@@ -333,6 +334,9 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
     preview = summary.get("preview") or "(no preview available)"
     parts.append(f"**Preview:**\n\n{preview}\n\n")
 
+    # For added/removed files we show the full file content but rendered as a diff:
+    # - added => each line prefixed with '+', shown inside a ```diff block (green)
+    # - removed => each line prefixed with '-', shown inside a ```diff block (red)
     if status in ("added", "removed"):
         content = summary.get("content") or ""
         lines = content.splitlines()
@@ -343,11 +347,20 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
             for i in range(0, len(lines), MAX_LINES_PER_SECTION):
                 chunk = lines[i: i + MAX_LINES_PER_SECTION]
                 part = i // MAX_LINES_PER_SECTION + 1
+
+                # prefix lines for diff coloring
+                if status == "added":
+                    prefixed = [("+" + ln) for ln in chunk]
+                else:  # removed
+                    prefixed = [("-" + ln) for ln in chunk]
+
                 details = (
                     f"<details>\n<summary>Part {part}/{total} — click to expand</summary>\n\n"
-                    f"```xml\n" + "\n".join(chunk) + "\n```\n\n</details>\n"
+                    f"```diff\n" + "\n".join(prefixed) + "\n```\n\n</details>\n"
                 )
                 parts.append(details)
+
+    # Modified files: keep unified diff presentation (already uses + / -)
     elif status == "modified":
         diff_lines = summary.get("diff_lines") or []
         if not diff_lines:
