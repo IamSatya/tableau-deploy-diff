@@ -1,9 +1,10 @@
-// Jenkinsfile (multibranch) - ONLY prod & main branches
-// - PR builds (CHANGE_ID present): run diff bot (dry-run).
-// - When PR prod->main is merged, main branch build auto-deploys (DRY_RUN=false).
-// - Uses GenericTrigger webhook and Jenkins credential 'github-token' (PAT).
-// Webhook endpoint example:
-// https://<JENKINS_URL>/generic-webhook-trigger/invoke?token=my-secret-webhook-token
+// Jenkinsfile (multibranch) - uses usernamePassword credential for GitHub PAT
+// - PR builds run the diff bot (dry-run).
+// - main branch build auto-deploys only when the merge commit is from a merged prod->main PR.
+// - Uses GenericTrigger for webhook payload mapping.
+// Credentials:
+//   - github-token : Username with password (password = GitHub PAT)
+//   - tableau-cred : Username with password (Tableau username/password)
 
 pipeline {
   agent any
@@ -63,14 +64,17 @@ pipeline {
       }
       steps {
         script {
-          // Only run diffs for PRs (we're in a repo with only prod & main branches)
+          // Only run diffs for PRs (we're only interested in prod -> main PRs and prod-targeted PRs)
           echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot (dry-run)."
+
+          // Bind GitHub PAT (stored as username/password) and Tableau creds
           withCredentials([
-            string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN'),
+            usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
             sh '''
               . .venv/bin/activate
+              export GITHUB_USER="${GITHUB_USER}"
               export GITHUB_TOKEN="${GITHUB_TOKEN}"
               export TABLEAU_USER="${TABLEAU_USER}"
               export TABLEAU_PW="${TABLEAU_PW}"
@@ -106,8 +110,9 @@ pipeline {
           def sha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
           echo "Main commit ${sha} - querying GitHub for PRs associated with this commit..."
 
+          // Use usernamePassword to supply GitHub PAT (password) and Tableau creds
           withCredentials([
-            string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN'),
+            usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
             // Query GitHub API for PRs linked to this commit
