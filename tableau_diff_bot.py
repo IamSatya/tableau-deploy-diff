@@ -3,6 +3,7 @@
 Tableau diff bot — post full diffs split across multiple PR comments (no gist).
 Colorized: added lines show green (+), removed lines show red (-).
 Safe-splitting: never breaks code fences; large code blocks are split into multiple fenced chunks.
+This patched version uses byte-aware splitting to avoid GitHub 422 "Body is too long" errors.
 """
 import os
 import re
@@ -42,8 +43,8 @@ EXTRACTION_INITIAL_DELAY_SEC = float(os.getenv("EXTRACTION_INITIAL_DELAY_SEC", "
 EXTRACTION_MAX_RETRIES = int(os.getenv("EXTRACTION_MAX_RETRIES", "4"))
 EXTRACTION_BACKOFF_FACTOR = float(os.getenv("EXTRACTION_BACKOFF_FACTOR", "2"))
 
-# Comment splitting config
-SAFE_COMMENT_CHARS = int(os.getenv("SAFE_COMMENT_CHARS", "65000"))
+# Comment splitting config (interpreted as bytes now)
+SAFE_COMMENT_CHARS = int(os.getenv("SAFE_COMMENT_CHARS", "60000"))
 
 # Keep optional per-file separate comments (true/false)
 CREATE_PER_FILE_COMMENTS = os.getenv("CREATE_PER_FILE_COMMENTS", "false").lower() in ("1","true","yes")
@@ -67,6 +68,14 @@ retries = Retry(total=5, backoff_factor=1,
                 status_forcelist=(429, 500, 502, 503, 504),
                 allowed_methods=("GET", "POST", "PUT", "DELETE", "PATCH"))
 session.mount("https://", HTTPAdapter(max_retries=retries))
+
+
+# ---------- Helper: byte-length aware ----------
+def byte_len(s: str) -> int:
+    """Return length in bytes for UTF-8 encoding."""
+    if s is None:
+        return 0
+    return len(s.encode("utf-8"))
 
 
 # ---------- Extraction and normalization ----------
@@ -381,12 +390,6 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
         if not diff_lines:
             parts.append("✅ No meaningful changes detected.\n\n")
         else:
-            # clean any stray BOM/CR in diff lines and ensure no HTML-escaping
-            cleaned = [ln[1:] and ln for ln in [l.rstrip("\r") for l in diff_lines]]  # minimal pass to preserve leading +/-/space/@
-
-            # fallback if that odd construct produced wrong results: use a safer clean
-            cleaned = [ (l[1:] and l) or l for l in [l.rstrip("\r") for l in diff_lines] ]
-
             # actually, simpler: just strip \r and BOM, keep content unchanged
             cleaned = []
             for l in diff_lines:
@@ -414,104 +417,200 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
     return "\n".join(parts)
 
 
-# ---------- Splitting utilities that preserve fences ----------
+# ---------- Splitting utilities that preserve fences (BYTE-BASED) ----------
 def split_into_chunks(text: str, max_chars: int) -> List[str]:
     """
-    Split a long text into multiple chunks of <= max_chars.
-    This splits on newline boundaries when possible to avoid cutting lines.
+    Byte-aware chunking: accumulate whole lines until adding the next line
+    would exceed max_chars bytes. This avoids cutting lines in half.
     """
     if not text:
         return []
-    if len(text) <= max_chars:
+    max_bytes = int(max_chars)
+    if byte_len(text) <= max_bytes:
         return [text]
-    chunks = []
-    start = 0
-    N = len(text)
-    while start < N:
-        end = min(start + max_chars, N)
-        if end < N:
-            nl = text.rfind("\n", start, end)
-            if nl > start:
-                end = nl + 1
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end
+
+    lines = text.splitlines(keepends=True)
+    chunks: List[str] = []
+    cur_lines: List[str] = []
+    cur_bytes = 0
+    for ln in lines:
+        ln_bytes = byte_len(ln)
+        # if single line itself exceeds, split it forcibly by bytes
+        if ln_bytes > max_bytes:
+            # flush current
+            if cur_lines:
+                chunks.append("".join(cur_lines))
+                cur_lines = []
+                cur_bytes = 0
+            # break the long line into byte-respecting slices
+            b = ln.encode("utf-8")
+            start = 0
+            while start < len(b):
+                end = min(start + max_bytes, len(b))
+                slice_bytes = b[start:end]
+                # backtrack end until byte slice decodes
+                while True:
+                    try:
+                        piece = slice_bytes.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        end -= 1
+                        slice_bytes = b[start:end]
+                        if end <= start:
+                            # extremely unlikely, break out
+                            piece = slice_bytes.decode("utf-8", errors="replace")
+                            break
+                chunks.append(piece)
+                start = end
+            continue
+
+        # normal case: accumulate lines
+        if cur_bytes + ln_bytes <= max_bytes:
+            cur_lines.append(ln)
+            cur_bytes += ln_bytes
+        else:
+            # flush and start new chunk
+            if cur_lines:
+                chunks.append("".join(cur_lines))
+            cur_lines = [ln]
+            cur_bytes = ln_bytes
+    if cur_lines:
+        chunks.append("".join(cur_lines))
     return chunks
 
 
 def _split_code_block_by_chars(code_text: str, max_code_chars: int) -> List[str]:
     """
-    Split code_text (the interior of a code fence) into newline-respecting chunks
-    each with length <= max_code_chars (approx). Returns list of code-only chunks.
+    Split code_text into chunks whose UTF-8 byte-length <= max_code_chars.
+    Works line-by-line to avoid breaking logical lines; falls back to forced byte-slices
+    for extremely long single lines.
     """
     if not code_text:
         return []
-    lines = code_text.splitlines()
-    chunks = []
-    cur_lines = []
-    cur_len = 0
+    max_bytes = int(max_code_chars)
+    lines = code_text.splitlines(keepends=True)
+    chunks: List[str] = []
+    cur_lines: List[str] = []
+    cur_bytes = 0
     for ln in lines:
-        to_add = len(ln) + 1
-        if cur_lines and cur_len + to_add > max_code_chars:
-            chunks.append("\n".join(cur_lines))
-            cur_lines = [ln]
-            cur_len = to_add
-        else:
+        ln_b = byte_len(ln)
+        if ln_b > max_bytes:
+            # flush current
+            if cur_lines:
+                chunks.append("".join(cur_lines))
+                cur_lines = []
+                cur_bytes = 0
+            # break this long line into UTF-8-safe slices
+            b = ln.encode("utf-8")
+            start = 0
+            while start < len(b):
+                end = min(start + max_bytes, len(b))
+                slice_bytes = b[start:end]
+                while True:
+                    try:
+                        piece = slice_bytes.decode("utf-8")
+                        break
+                    except UnicodeDecodeError:
+                        end -= 1
+                        slice_bytes = b[start:end]
+                        if end <= start:
+                            piece = slice_bytes.decode("utf-8", errors="replace")
+                            break
+                chunks.append(piece)
+                start = end
+            continue
+        if cur_bytes + ln_b <= max_bytes:
             cur_lines.append(ln)
-            cur_len += to_add
+            cur_bytes += ln_b
+        else:
+            # flush current chunk
+            if cur_lines:
+                chunks.append("".join(cur_lines))
+            cur_lines = [ln]
+            cur_bytes = ln_b
     if cur_lines:
-        chunks.append("\n".join(cur_lines))
+        chunks.append("".join(cur_lines))
     return chunks
 
 
 def split_section_preserve_fences(section: str, max_chars: int) -> List[str]:
     """
     Break a section into safe sub-parts that don't break fenced blocks.
-    - Finds ```diff\n ... \n``` blocks and splits them internally if needed.
-    - Splits non-code text on newline boundaries using split_into_chunks behavior.
-    Returns list of pieces suitable to be appended to comment bodies.
+    Ensures every returned piece is <= max_chars bytes.
     """
     if not section:
         return []
     pieces: List[str] = []
+    max_bytes = int(max_chars)
+
     # pattern catches ```diff\n ... \n``` ; DOTALL to include newlines
     fence_pat = re.compile(r'```diff\n(.*?)\n```', re.DOTALL)
     last = 0
     for m in fence_pat.finditer(section):
         pre = section[last:m.start()]
         if pre:
-            pieces.extend(split_into_chunks(pre, max_chars))
+            # split pre into byte-aware chunks
+            pieces.extend(split_into_chunks(pre, max_bytes))
         code_inner = m.group(1)
-        overhead = len("```diff\n\n```\n")
-        max_code_chars = max(200, max_chars - overhead - 200)
-        code_chunks = _split_code_block_by_chars(code_inner, max_code_chars)
+        # prepare overhead in bytes for the fenced wrapper
+        overhead = byte_len("```diff\n") + byte_len("\n```")
+        # compute safe bytes for code interior
+        safe_code_bytes = max(200, max_bytes - overhead - 200)
+        code_chunks = _split_code_block_by_chars(code_inner, safe_code_bytes)
+        # wrap each code chunk into a fenced block and ensure it is under max_bytes;
+        # if a wrapped chunk somehow still > max_bytes, further split by forced byte slicing.
         for cc in code_chunks:
             fenced = "```diff\n" + cc + "\n```"
-            pieces.append(fenced)
+            if byte_len(fenced) <= max_bytes:
+                pieces.append(fenced)
+            else:
+                # forced split of fenced by bytes (safe because we don't cut inside backticks)
+                inner_chunks = _split_code_block_by_chars(cc, max_bytes - overhead)
+                for ic in inner_chunks:
+                    pieces.append("```diff\n" + ic + "\n```")
         last = m.end()
     tail = section[last:]
     if tail:
-        pieces.extend(split_into_chunks(tail, max_chars))
-    return pieces
+        pieces.extend(split_into_chunks(tail, max_bytes))
+
+    # As a final safety, ensure no piece exceeds the byte limit; if any do, force-trim them
+    final_pieces: List[str] = []
+    for p in pieces:
+        if byte_len(p) <= max_bytes:
+            final_pieces.append(p)
+        else:
+            # last-resort: break the piece by bytes preserving newlines where possible
+            chunks = split_into_chunks(p, max_bytes)
+            final_pieces.extend(chunks)
+    return final_pieces
 
 
 def pack_sections_to_comment_bodies(header_tag: str, intro: str, sections: List[str], max_chars: int) -> List[str]:
     """
     Pack list of sections into comment bodies without breaking fenced code blocks.
-    Uses split_section_preserve_fences to ensure safe splitting.
+    Uses byte-aware splits to ensure each body <= max_chars bytes.
     """
     bodies: List[str] = []
-    current = header_tag + "\n\n" + intro + "\n"
+    max_bytes = int(max_chars)
+    header_and_intro = header_tag + "\n\n" + intro + "\n"
+    # start with header+intro bytes
+    current = header_and_intro
     for section in sections:
-        safe_parts = split_section_preserve_fences(section, max_chars)
+        safe_parts = split_section_preserve_fences(section, max_bytes)
         for part in safe_parts:
             # ensure no leading spaces before a fence
             part = re.sub(r'^\s+```', '```', part, flags=re.MULTILINE)
-            if len(current) + len(part) <= max_chars:
+            if byte_len(current) + byte_len(part) <= max_bytes:
                 current += part
             else:
                 bodies.append(current)
-                current = header_tag + "\n\n" + intro + "\n" + part
+                current = header_and_intro + part
+                # if newly started current already exceeds, split it immediately
+                if byte_len(current) > max_bytes:
+                    # split current into safe chunks and append the first, keep the rest as current
+                    chunks = split_into_chunks(current, max_bytes)
+                    bodies.extend(chunks[:-1])
+                    current = chunks[-1]
     if current.strip():
         bodies.append(current)
     if bodies:
@@ -625,7 +724,7 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
             section = build_file_section(s, pr_number)
             file_sections.append(section)
 
-        # Pack sections into multiple comment bodies (each <= SAFE_COMMENT_CHARS)
+        # Pack sections into multiple comment bodies (each <= SAFE_COMMENT_CHARS bytes)
         comment_bodies = pack_sections_to_comment_bodies(header_tag, intro, file_sections, SAFE_COMMENT_CHARS)
 
         # Clean up any previous bot comments for this PR with same tag
