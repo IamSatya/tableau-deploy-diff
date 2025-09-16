@@ -1,4 +1,3 @@
-// Jenkinsfile - multibranch-friendly (patched robust owner/repo parsing)
 pipeline {
   agent any
 
@@ -80,35 +79,32 @@ pipeline {
                   . .venv/bin/activate
                 fi
 
-                # Robust owner/repo derivation:
-                # - handle git@github.com:owner/repo.git
-                # - handle https://github.com/owner/repo.git
-                # - handle ssh://git@github.com/owner/repo.git
-                # We transform separators ":" and "/" to spaces and pick the last two tokens.
-                GIT_URL="$(git config --get remote.origin.url || true)"
+                # Derive owner/repo robustly:
+                # handles:
+                #   git@github.com:owner/repo.git
+                #   https://github.com/owner/repo.git
+                #   ssh://git@github.com/owner/repo.git
+                GIT_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
                 OWNER=""
                 REPO=""
                 if [ -n "$GIT_URL" ]; then
-                  # remove trailing .git if present
-                  GIT_URL="${GIT_URL%.git}"
-                  # replace ':' and '/' with space, then take last two fields
-                  # use 'set --' to populate positional params robustly
-                  IFS=' ' read -r -a parts <<< "$(echo "$GIT_URL" | tr '/:' ' ')"
-                  len=${#parts[@]}
-                  if [ "$len" -ge 2 ]; then
-                    OWNER="${parts[$((len-2))]}"
-                    REPO="${parts[$((len-1))]}"
+                  # strip trailing .git
+                  CLEAN_URL="$(echo "$GIT_URL" | sed -E 's#\.git$##')"
+                  # split on ":" or "/" and take last two tokens using awk
+                  OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' '{print $(NF-1)\"/\"$NF}')"
+                  if [ -n "$OWNER_REPO" ] && [ "$(echo "$OWNER_REPO" | awk -F'/' '{print NF}')" -ge 2 ]; then
+                    OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
+                    REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
                   fi
                 fi
 
+                # fallback to webhook-provided envs if any (GenericTrigger) - these may be empty
                 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
-                  echo "WARNING: Could not derive OWNER/REPO from git remote; falling back to webhook-provided envs if any"
-                  # if webhook provided OWNER/REPO envs (GenericTrigger), respect them
                   OWNER="${OWNER:-$OWNER_FROM_WEBHOOK}"
                   REPO="${REPO:-$REPO_FROM_WEBHOOK}"
                 fi
 
-                echo "Derived OWNER='$OWNER' REPO='$REPO' from git remote."
+                echo "Derived OWNER='$OWNER' REPO='$REPO'"
 
                 # Map Jenkins multibranch CHANGE_* envs into variables expected by python bot
                 export PR_NUMBER="${CHANGE_ID}"
@@ -120,7 +116,7 @@ pipeline {
 
                 echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER} (head=${PR_SOURCE_BRANCH} base=${PR_TARGET_BRANCH})"
 
-                # Call python diff bot (secrets available in env via withCredentials)
+                # Run python diff bot (secrets available from withCredentials)
                 python "${TABLEAU_DIFF_PY}"
               '
             '''
@@ -148,28 +144,28 @@ pipeline {
               bash -lc '
                 set -euo pipefail
 
-                # Derive owner/repo (same robust method)
-                GIT_URL="$(git config --get remote.origin.url || true)"
-                GIT_URL="${GIT_URL%.git}"
-                IFS=" " read -r -a parts <<< "$(echo "$GIT_URL" | tr "/:" " ")"
-                len=${#parts[@]}
-                if [ "$len" -ge 2 ]; then
-                  OWNER="${parts[$((len-2))]}"
-                  REPO="${parts[$((len-1))]}"
-                else
-                  echo "ERROR: Unable to determine owner/repo from git remote."
+                # Derive owner/repo (robust method)
+                GIT_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
+                if [ -z "$GIT_URL" ]; then
+                  echo "ERROR: cannot determine git remote URL to call GitHub API."
                   exit 1
                 fi
+                CLEAN_URL="$(echo "$GIT_URL" | sed -E "s#\\.git$##")"
+                OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' "{print \$(NF-1)\"/\"\$NF}")"
+                OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
+                REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
 
                 SHA="$(git rev-parse HEAD)"
                 echo "Querying GitHub for PRs linked to commit $SHA..."
 
                 PRS_JSON="$(curl -s -H "Accept: application/vnd.github.groot-preview+json" -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER}/${REPO}/commits/${SHA}/pulls")"
+
                 if [ -z "$PRS_JSON" ] || [ "$PRS_JSON" = "null" ]; then
                   echo "ERROR: Empty response from GitHub for commit PR list. Aborting."
                   exit 1
                 fi
 
+                # find merged PR where head.ref == "prod"
                 PR_NUMBER="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .number' | head -n1 || true)"
                 PR_TITLE="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .title' | head -n1 || true)"
                 PR_USER="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .user.login' | head -n1 || true)"
