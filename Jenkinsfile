@@ -40,7 +40,6 @@ pipeline {
 
     stage('Prepare Environment') {
       steps {
-        // use a heredoc to avoid quoting pitfalls
         sh '''
 /bin/bash -e <<'BASH'
 set -euo pipefail
@@ -105,14 +104,15 @@ REPO="${REPO:-$REPO_FROM_WEBHOOK}"
 echo "Derived OWNER='${OWNER}' REPO='${REPO}'"
 
 # Map Jenkins multibranch CHANGE_* envs into variables expected by python bot
-export PR_NUMBER="${CHANGE_ID}"
-export PR_SOURCE_BRANCH="${CHANGE_BRANCH}"
-export PR_TARGET_BRANCH="${CHANGE_TARGET}"
+# -> Export the exact names the Python bot requires
 export OWNER="${OWNER}"
 export REPO="${REPO}"
+export PR_NUMBER="${CHANGE_ID}"
+export HEAD_BRANCH="${CHANGE_BRANCH}"
+export BASE_BRANCH="${CHANGE_TARGET}"
 export DRY_RUN="${DRY_RUN_DEFAULT}"
 
-echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER} (head=${PR_SOURCE_BRANCH} base=${PR_TARGET_BRANCH})"
+echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER} (head=${HEAD_BRANCH} base=${BASE_BRANCH})"
 
 # call python bot (credentials available via env)
 python "${TABLEAU_DIFF_PY}"
