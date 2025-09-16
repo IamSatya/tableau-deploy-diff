@@ -327,16 +327,30 @@ def fetch_pr_files(owner: str, repo: str, pr_number: str) -> List[dict]:
 
 # ---------- Build file section (colorized add/remove) ----------
 def build_file_section(summary: Dict, pr_number: str) -> str:
-    fp = html.escape(summary["file_path"])
+    """
+    Build a markdown section for one file. For added/removed files we
+    render the content inside a ```diff``` fence and prefix every line
+    with '+' (added) or '-' (removed) so GitHub colors them green/red.
+    For modified files we render the unified diff (already contains +/-).
+    """
+    fp_safe = html.escape(summary["file_path"])
     status = summary["status"]
-    title = f"**{fp}** — {status}"
+    title = f"**{fp_safe}** — {status}"
     parts = [f"### {title}\n"]
+
+    # Small legend
+    parts.append("**Legend:** `+` = addition (green), `-` = removal (red)\n\n")
+
     preview = summary.get("preview") or "(no preview available)"
     parts.append(f"**Preview:**\n\n{preview}\n\n")
 
-    # For added/removed files we show the full file content but rendered as a diff:
-    # - added => each line prefixed with '+', shown inside a ```diff block (green)
-    # - removed => each line prefixed with '-', shown inside a ```diff block (red)
+    def clean_line(ln: str) -> str:
+        # remove BOMs and stray CRs but keep indentation (so xml remains readable)
+        if ln and ln[0] == "\ufeff":
+            ln = ln[1:]
+        return ln.rstrip("\r")
+
+    # Added / removed: show full file content but as a diff (prefix lines)
     if status in ("added", "removed"):
         content = summary.get("content") or ""
         lines = content.splitlines()
@@ -348,27 +362,30 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
                 chunk = lines[i: i + MAX_LINES_PER_SECTION]
                 part = i // MAX_LINES_PER_SECTION + 1
 
-                # prefix lines for diff coloring
+                # prefix lines for diff coloring — ensure prefix is at column 0
                 if status == "added":
-                    prefixed = [("+" + ln) for ln in chunk]
-                else:  # removed
-                    prefixed = [("-" + ln) for ln in chunk]
+                    prefixed = ["+" + clean_line(ln) for ln in chunk]
+                else:
+                    prefixed = ["-" + clean_line(ln) for ln in chunk]
 
+                # join with newline; ensure there's no accidental leading spaces before fence
                 details = (
                     f"<details>\n<summary>Part {part}/{total} — click to expand</summary>\n\n"
                     f"```diff\n" + "\n".join(prefixed) + "\n```\n\n</details>\n"
                 )
                 parts.append(details)
 
-    # Modified files: keep unified diff presentation (already uses + / -)
+    # Modified: keep unified diff (already has + / - / @@)
     elif status == "modified":
         diff_lines = summary.get("diff_lines") or []
         if not diff_lines:
             parts.append("✅ No meaningful changes detected.\n\n")
         else:
-            total = (len(diff_lines) - 1) // MAX_LINES_PER_SECTION + 1
-            for i in range(0, len(diff_lines), MAX_LINES_PER_SECTION):
-                chunk = diff_lines[i: i + MAX_LINES_PER_SECTION]
+            # clean any stray CR/BOM from diff lines as well
+            cleaned = [clean_line(ln) for ln in diff_lines]
+            total = (len(cleaned) - 1) // MAX_LINES_PER_SECTION + 1
+            for i in range(0, len(cleaned), MAX_LINES_PER_SECTION):
+                chunk = cleaned[i: i + MAX_LINES_PER_SECTION]
                 part = i // MAX_LINES_PER_SECTION + 1
                 details = (
                     f"<details>\n<summary>Diff Part {part}/{total} — click to expand</summary>\n\n"
