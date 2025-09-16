@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Tableau diff bot — patched, full script.
+Tableau diff bot — post full diffs split across multiple PR comments (no gist).
 
-Features:
-- Extracts .twb/.twbx from PR changes, normalizes XML, computes minimal diffs.
-- Builds aggregated PR content divided into file sections.
-- Packs sections into multiple PR comments of <= MAX_COMMENT_CHARS characters.
-- If a single file-section itself is too big, attempts to create a Gist and post a small link.
-- If gist creation fails or creating comment parts returns 422, falls back to per-file comments + tiny summary.
-- Cleans up previous bot-managed aggregated comments before posting updated comments.
+Behavior:
+- Extract .twb/.twbx, normalize, compute minimal diffs.
+- Build one aggregated set of sections (one per file).
+- Split sections into sub-chunks and pack into comment bodies of <= SAFE_COMMENT_CHARS chars.
+- Delete previous bot-managed aggregated comments (SEARCHABLE_PR_TAG) and post the new chunked comments.
+- If posting aggregated comments fails with 422, fall back to posting per-file comments (also chunked).
 """
 import os
 import re
@@ -28,6 +27,7 @@ import difflib
 from dotenv import load_dotenv
 import html
 import json
+import math
 
 load_dotenv()
 
@@ -41,20 +41,25 @@ MAX_LINES_PER_SECTION = int(os.getenv("MAX_LINES_PER_SECTION", "1000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 SEARCHABLE_PR_TAG = os.getenv("SEARCHABLE_PR_TAG", "#tableau-diff-pr")
+
 # Extraction delay/retry config
 EXTRACTION_DELAY_THRESHOLD_BYTES = int(os.getenv("EXTRACTION_DELAY_THRESHOLD_BYTES", str(8_000_000)))  # 8MB
 EXTRACTION_INITIAL_DELAY_SEC = float(os.getenv("EXTRACTION_INITIAL_DELAY_SEC", "2"))
 EXTRACTION_MAX_RETRIES = int(os.getenv("EXTRACTION_MAX_RETRIES", "4"))
 EXTRACTION_BACKOFF_FACTOR = float(os.getenv("EXTRACTION_BACKOFF_FACTOR", "2"))
-# Comment / gist thresholds
-MAX_COMMENT_CHARS = int(os.getenv("MAX_COMMENT_CHARS", "60000"))  # must be <= GitHub limit (65536)
-UPLOAD_TO_GIST_THRESHOLD_CHARS = int(os.getenv("UPLOAD_TO_GIST_THRESHOLD_CHARS", "50000"))
+
+# Comment splitting config
+# GitHub hard limit ~65536; use SAFE_COMMENT_CHARS slightly lower by default
+SAFE_COMMENT_CHARS = int(os.getenv("SAFE_COMMENT_CHARS", "65000"))
+
+# Keep optional per-file separate comments (true/false)
 CREATE_PER_FILE_COMMENTS = os.getenv("CREATE_PER_FILE_COMMENTS", "false").lower() in ("1","true","yes")
-GIST_PUBLIC = os.getenv("GIST_PUBLIC", "false").lower() in ("1","true","yes")
+
+GIST_PUBLIC = os.getenv("GIST_PUBLIC", "false").lower() in ("1","true","yes")  # not used (kept for compatibility)
 
 # logging
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("tableau-diff-splitter")
+logger = logging.getLogger("tableau-diff-split-chunker")
 
 if not GITHUB_TOKEN:
     logger.error("GITHUB_TOKEN is not set. Exiting.")
@@ -86,10 +91,10 @@ def normalize_xml_for_diff(xml_text: str) -> str:
         re.compile(r".*modified-time.*", re.IGNORECASE),
     ]
     patterns_mask = [
-        (re.compile(r'(<workbook.*?project-luid=")[^"]+(")') , r"\1<redacted>\2"),
-        (re.compile(r'(<datasource.*?luid=")[^"]+(")') , r"\1<redacted>\2"),
-        (re.compile(r'(<connection.*?id=")[^"]+(")') , r"\1<redacted>\2"),
-        (re.compile(r'(<uid>)[^<]+(</uid>)') , r"\1<redacted>\2"),
+        (re.compile(r'(<workbook.*?project-luid=")[^"]+(")'), r"\1<redacted>\2"),
+        (re.compile(r'(<datasource.*?luid=")[^"]+(")'), r"\1<redacted>\2"),
+        (re.compile(r'(<connection.*?id=")[^"]+(")'), r"\1<redacted>\2"),
+        (re.compile(r'(<uid>)[^<]+(</uid>)'), r"\1<redacted>\2"),
     ]
     for ln in lines:
         skip = False
@@ -185,30 +190,7 @@ def generate_minimal_diff(old_content: str, new_content: str) -> List[str]:
     return [line for line in diff if line.startswith(("+", "-", "@@"))]
 
 
-# ---------- GitHub helpers (gist, comments) ----------
-def create_gist(files: Dict[str, str], description: str = "Tableau diff", public: bool = GIST_PUBLIC) -> Optional[str]:
-    url = f"{GITHUB_API}/gists"
-    payload = {"files": {name: {"content": content} for name, content in files.items()},
-               "description": description,
-               "public": public}
-    try:
-        r = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code in (200, 201):
-            data = r.json()
-            gist_url = data.get("html_url")
-            logger.info(f"Created gist: {gist_url}")
-            return gist_url
-        elif r.status_code == 404:
-            logger.warning("Gist creation returned 404 — token may lack 'gist' scope or endpoint disabled in environment.")
-            return None
-        else:
-            logger.warning(f"Failed to create gist: {r.status_code} {r.text}")
-            return None
-    except Exception:
-        logger.exception("Exception creating gist")
-    return None
-
-
+# ---------- GitHub helpers (comments) ----------
 def _create_pr_comment(owner: str, repo: str, pr_number: str, body: str) -> dict:
     url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/comments"
     r = session.post(url, json={"body": body}, timeout=REQUEST_TIMEOUT)
@@ -342,7 +324,7 @@ def fetch_pr_files(owner: str, repo: str, pr_number: str) -> List[dict]:
     return results
 
 
-# ---------- Building aggregated content ----------
+# ---------- Build file section ----------
 def build_file_section(summary: Dict, pr_number: str) -> str:
     fp = html.escape(summary["file_path"])
     status = summary["status"]
@@ -353,40 +335,24 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
 
     if status in ("added", "removed"):
         content = summary.get("content") or ""
-        if content and len(content) > UPLOAD_TO_GIST_THRESHOLD_CHARS:
-            gist_url = create_gist({f"{summary['file_path']}.xml": content}, description=f"{summary['file_path']} content for PR {pr_number}")
-            if gist_url:
-                parts.append(f"Full content is large — view it on a gist: {gist_url}\n\n")
-            else:
-                lines = content.splitlines()
-                chunk = lines[:MAX_LINES_PER_SECTION]
-                parts.append("```xml\n" + "\n".join(chunk) + "\n```\n\n")
+        lines = content.splitlines()
+        if not lines:
+            parts.append("_(No content to show)_\n\n")
         else:
-            lines = (summary.get("content") or "").splitlines()
-            if not lines:
-                parts.append("_(No content to show)_\n\n")
-            else:
-                total = (len(lines) - 1) // MAX_LINES_PER_SECTION + 1
-                for i in range(0, len(lines), MAX_LINES_PER_SECTION):
-                    chunk = lines[i: i + MAX_LINES_PER_SECTION]
-                    part = i // MAX_LINES_PER_SECTION + 1
-                    details = (
-                        f"<details>\n<summary>Part {part}/{total} — click to expand</summary>\n\n"
-                        f"```xml\n" + "\n".join(chunk) + "\n```\n\n</details>\n"
-                    )
-                    parts.append(details)
+            total = (len(lines) - 1) // MAX_LINES_PER_SECTION + 1
+            for i in range(0, len(lines), MAX_LINES_PER_SECTION):
+                chunk = lines[i: i + MAX_LINES_PER_SECTION]
+                part = i // MAX_LINES_PER_SECTION + 1
+                details = (
+                    f"<details>\n<summary>Part {part}/{total} — click to expand</summary>\n\n"
+                    f"```xml\n" + "\n".join(chunk) + "\n```\n\n</details>\n"
+                )
+                parts.append(details)
     elif status == "modified":
         diff_lines = summary.get("diff_lines") or []
         if not diff_lines:
             parts.append("✅ No meaningful changes detected.\n\n")
         else:
-            joined = "\n".join(diff_lines)
-            if len(joined) > UPLOAD_TO_GIST_THRESHOLD_CHARS:
-                gist_url = create_gist({f"{summary['file_path']}.diff": joined}, description=f"Diff for {summary['file_path']} (PR {pr_number})")
-                if gist_url:
-                    parts.append(f"Diff is large — view full diff in a gist: {gist_url}\n\n")
-                else:
-                    parts.append("Diff is large; showing first part below.\n\n")
             total = (len(diff_lines) - 1) // MAX_LINES_PER_SECTION + 1
             for i in range(0, len(diff_lines), MAX_LINES_PER_SECTION):
                 chunk = diff_lines[i: i + MAX_LINES_PER_SECTION]
@@ -403,61 +369,90 @@ def build_file_section(summary: Dict, pr_number: str) -> str:
     return "\n".join(parts)
 
 
-def pack_sections_into_comments(header_tag: str, intro: str, file_sections: List[str], max_chars: int) -> List[str]:
-    comments = []
+# ---------- Splitting utilities ----------
+def split_into_chunks(text: str, max_chars: int) -> List[str]:
+    """
+    Split a long text into multiple chunks of <= max_chars.
+    This splits on newline boundaries when possible to avoid cutting lines.
+    """
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    chunks = []
+    start = 0
+    N = len(text)
+    while start < N:
+        end = min(start + max_chars, N)
+        if end < N:
+            # try to back up to last newline to keep chunks clean
+            nl = text.rfind("\n", start, end)
+            if nl > start:
+                end = nl + 1  # include newline
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end
+    return chunks
+
+
+def pack_sections_to_comment_bodies(header_tag: str, intro: str, sections: List[str], max_chars: int) -> List[str]:
+    """
+    Pack list of sections (each may be long) into sequential comment bodies, each <= max_chars.
+    Each section may be split into internal sub-chunks using split_into_chunks.
+    Returns list of comment bodies.
+    """
+    bodies: List[str] = []
     current = header_tag + "\n\n" + intro + "\n"
-    for section in file_sections:
-        if len(current) + len(section) > max_chars:
-            if current.strip() == (header_tag + "\n\n" + intro).strip() and len(section) > max_chars:
-                truncated = section[:max_chars - len(current) - 200]
-                current += truncated + "\n\n" + "(truncated — full content in gist)\n"
-                comments.append(current)
-                current = header_tag + "\n\n" + intro + "\n"
+    for section in sections:
+        # If section fits, try to append to current.
+        if len(section) <= max_chars:
+            if len(current) + len(section) <= max_chars:
+                current += section
             else:
-                comments.append(current)
+                bodies.append(current)
                 current = header_tag + "\n\n" + intro + "\n" + section
         else:
-            current += section
+            # section is larger than max_chars: split into sub-chunks and append each one (attempt to pack multiple small ones)
+            sub_chunks = split_into_chunks(section, max_chars - len(header_tag) - 200)  # leave space for header & part text
+            for sc in sub_chunks:
+                if len(current) + len(sc) <= max_chars:
+                    current += sc
+                else:
+                    bodies.append(current)
+                    current = header_tag + "\n\n" + intro + "\n" + sc
     if current.strip():
-        comments.append(current)
-    if comments:
-        comments[-1] += f"\n\n*Tip:* Search for the tag `{header_tag}` to find these comments."
-    return comments
+        bodies.append(current)
+    # annotate final body with tip
+    if bodies:
+        bodies[-1] += f"\n\n*Tip:* Search for the tag `{header_tag}` to find these comments."
+    return bodies
 
 
-# ---------- Fallback helper ----------
+# ---------- Fallback helper (per-file posting) ----------
 def _fallback_post_per_file_and_summary(owner: str, repo: str, pr_number: str, pr_tag: str, file_summaries: List[Dict]):
-    """
-    Robust fallback: post per-file comments (small snippets) and a tiny PR summary.
-    Used when aggregated posting or gist creation fails.
-    """
-    logger.info("Running fallback: posting per-file comments and short PR summary")
+    logger.info("Fallback: posting per-file chunked comments and short PR summary")
     for s in file_summaries:
-        fb_parts = [f"#tableau-file {s['file_path']}\n\n",
-                    f"**File:** `{html.escape(s['file_path'])}`\n\n",
-                    f"**Status:** {s['status']}\n\n",
-                    f"**Preview:**\n\n{s.get('preview') or '(no preview)'}\n\n"]
-        inline_text = ""
-        if s.get("status") in ("added", "removed"):
-            c = s.get("content") or ""
-            inline_text = "\n".join(c.splitlines()[:MAX_LINES_PER_SECTION])
-        else:
-            dl = s.get("diff_lines") or []
-            inline_text = "\n".join(dl[:MAX_LINES_PER_SECTION])
-        if inline_text:
-            fence = "diff" if s.get("status") == "modified" else "xml"
-            fb_parts.append(f"```{fence}\n" + inline_text + "\n```\n")
-        body_file = "\n".join(fb_parts)
-        try:
-            _create_or_update_file_comment(owner, repo, pr_number, s['file_path'], body_file)
-        except Exception:
-            logger.exception(f"Failed fallback posting per-file comment for {s['file_path']}")
+        section = build_file_section(s, pr_number)
+        # split section into chunks and post each as its own comment part
+        chunks = split_into_chunks(section, SAFE_COMMENT_CHARS)
+        for i, c in enumerate(chunks, start=1):
+            part_header = f"#tableau-file {s['file_path']} — Part {i}/{len(chunks)}"
+            body = c.replace(f"**{html.escape(s['file_path'])}**", f"**{html.escape(s['file_path'])}**")  # keep same
+            # ensure tag present
+            if "#tableau-file" not in body:
+                body = part_header + "\n\n" + body
+            try:
+                _create_or_update_file_comment(owner, repo, pr_number, s['file_path'], body)
+            except Exception:
+                logger.exception(f"Failed posting fallback per-file chunk for {s['file_path']}")
+            time.sleep(0.3)
 
+    # tiny PR summary
     summary_lines = []
     for s in file_summaries:
         first_preview = (s.get('preview') or '').splitlines()[0] if s.get('preview') else '(no preview)'
         summary_lines.append(f"- `{s['file_path']}`: {s['status']} — {first_preview[:120]}")
-    tiny = f"{pr_tag}\n\nFull diffs were too large to post inline and gist creation failed or is not permitted.\n\nSummary:\n\n" + "\n".join(summary_lines)
+    tiny = f"{pr_tag}\n\nFull diffs were too large to post as aggregated comments; posted per-file chunked comments instead.\n\nSummary:\n\n" + "\n".join(summary_lines)
     try:
         _create_pr_comment(owner, repo, pr_number, tiny)
     except Exception:
@@ -540,24 +535,10 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
         file_sections = []
         for s in file_summaries:
             section = build_file_section(s, pr_number)
-            if len(section) > MAX_COMMENT_CHARS:
-                logger.warning(f"Section for {s['file_path']} is larger than MAX_COMMENT_CHARS — creating gist and linking.")
-                if s.get("status") in ("added", "removed"):
-                    content = s.get("content") or ""
-                    gist_url = create_gist({f"{s['file_path']}.xml": content}, description=f"{s['file_path']} content for PR {pr_number}")
-                else:
-                    diff_lines = s.get("diff_lines") or []
-                    gist_url = create_gist({f"{s['file_path']}.diff": "\n".join(diff_lines)}, description=f"Diff for {s['file_path']} (PR {pr_number})")
-                if gist_url:
-                    small = f"### **{html.escape(s['file_path'])}** — {s['status']}\n\nFull content/diff is large — view: {gist_url}\n\n---\n"
-                    file_sections.append(small)
-                    continue
-                else:
-                    section = section[: MAX_COMMENT_CHARS - 200] + "\n\n(truncated — failed to create gist)\n\n---\n"
             file_sections.append(section)
 
-        # Pack sections into multiple comment bodies
-        comment_bodies = pack_sections_into_comments(header_tag, intro, file_sections, MAX_COMMENT_CHARS)
+        # Pack sections into multiple comment bodies (each <= SAFE_COMMENT_CHARS)
+        comment_bodies = pack_sections_to_comment_bodies(header_tag, intro, file_sections, SAFE_COMMENT_CHARS)
 
         # Clean up any previous bot comments for this PR with same tag
         prev_comments = _list_bot_pr_comments(owner, repo, pr_number, header_tag)
@@ -568,7 +549,7 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
             except Exception:
                 logger.warning(f"Failed deleting old comment id={cid}; continuing.")
 
-        # Post each comment part sequentially, with robust fallback on 422
+        # Post each comment part sequentially, with fallback on 422
         posted_comment_ids = []
         aborted_with_422 = False
         for idx, body in enumerate(comment_bodies, start=1):
@@ -576,7 +557,7 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
             body_with_part = body.replace(header_tag, part_header, 1)
             res = _create_pr_comment(owner, repo, pr_number, body_with_part)
             if isinstance(res, dict) and res.get("error") == 422:
-                logger.warning("Detected 422 when creating an aggregated comment part; will fallback to per-file comments.")
+                logger.warning("Detected 422 when creating an aggregated comment part; will fallback to per-file chunked posting.")
                 aborted_with_422 = True
                 break
             elif isinstance(res, dict) and res.get("error"):
@@ -596,37 +577,23 @@ def process_pull_request(owner: str, repo: str, pr_number: str, base_branch: str
                     _delete_comment(owner, repo, pc.get("id"))
                 except Exception:
                     logger.warning(f"Could not delete partial comment id={pc.get('id')}")
-            # fallback to per-file + tiny summary
+            # fallback to per-file chunked comments + tiny summary
             _fallback_post_per_file_and_summary(owner, repo, pr_number, header_tag, file_summaries)
         else:
             logger.info(f"Posted {len(posted_comment_ids)} aggregated comment parts for PR {pr_number}")
 
-        # Optionally create/update per-file comments as well
+        # Optionally create/update separate per-file comments as well (chunked)
         if CREATE_PER_FILE_COMMENTS:
             for s in file_summaries:
-                fb_parts = [f"#tableau-file {s['file_path']}\n\n", f"**File:** `{html.escape(s['file_path'])}`\n\n", f"**Status:** {s['status']}\n\n", f"**Preview:**\n\n{s.get('preview') or '(no preview)'}\n\n"]
-                inline_text = ""
-                if s.get("status") in ("added","removed"):
-                    c = s.get("content") or ""
-                    if len(c) > UPLOAD_TO_GIST_THRESHOLD_CHARS:
-                        gist_url = create_gist({f"{s['file_path']}.xml": c}, description=f"{s['file_path']} content (PR {pr_number})")
-                        if gist_url:
-                            fb_parts.append(f"Full content: {gist_url}\n\n")
-                    else:
-                        inline_text = "\n".join((c.splitlines()[:MAX_LINES_PER_SECTION]))
-                else:
-                    dl = s.get("diff_lines") or []
-                    joined = "\n".join(dl)
-                    if len(joined) > UPLOAD_TO_GIST_THRESHOLD_CHARS:
-                        gist_url = create_gist({f"{s['file_path']}.diff": joined}, description=f"Diff for {s['file_path']} (PR {pr_number})")
-                        if gist_url:
-                            fb_parts.append(f"Full diff: {gist_url}\n\n")
-                    else:
-                        inline_text = "\n".join(dl[:MAX_LINES_PER_SECTION])
-                if inline_text:
-                    fb_parts.append("```diff\n" + inline_text + "\n```\n")
-                body_file = "\n".join(fb_parts)
-                _create_or_update_file_comment(owner, repo, pr_number, s['file_path'], body_file)
+                section = build_file_section(s, pr_number)
+                chunks = split_into_chunks(section, SAFE_COMMENT_CHARS)
+                for i, c in enumerate(chunks, start=1):
+                    part_header = f"#tableau-file {s['file_path']} — Part {i}/{len(chunks)}"
+                    body = c
+                    if "#tableau-file" not in body:
+                        body = part_header + "\n\n" + body
+                    _create_or_update_file_comment(owner, repo, pr_number, s['file_path'], body)
+                    time.sleep(0.3)
 
     except Exception:
         logger.exception("Error in process_pull_request")
@@ -639,7 +606,7 @@ def main():
     head_branch = os.getenv("HEAD_BRANCH")
     base_branch = os.getenv("BASE_BRANCH")
 
-    logger.info(f"Starting splitter bot for {owner}/{repo} PR {pr_number}")
+    logger.info(f"Starting chunked-post bot for {owner}/{repo} PR {pr_number}")
 
     if not all([owner, repo, pr_number, head_branch, base_branch]):
         logger.error("Missing required environment variables: OWNER, REPO, PR_NUMBER, HEAD_BRANCH, BASE_BRANCH")
