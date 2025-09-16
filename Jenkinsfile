@@ -1,30 +1,29 @@
-// Jenkinsfile (multibranch) - fixed: inject OWNER/REPO/HEAD/BASE/PR envs for PR runs
+// Jenkinsfile - multibranch-friendly for PR diff + automatic prod->main deploy
 pipeline {
   agent any
 
+  // GenericTrigger kept for webhook-based triggers; multibranch branch source will also create PR jobs.
   triggers {
-    // keep GenericTrigger if you still want webhook-based runs; for multibranch PR jobs GitHub Branch Source is used.
     GenericTrigger(
       genericVariables: [
-        [key: 'OWNER',       value: '$.repository.owner.login'],
-        [key: 'REPO',        value: '$.repository.name'],
+        [key: 'ACTION',      value: '$.action'],
         [key: 'PR_NUMBER',   value: '$.pull_request.number'],
         [key: 'HEAD_BRANCH', value: '$.pull_request.head.ref'],
         [key: 'BASE_BRANCH', value: '$.pull_request.base.ref'],
-        [key: 'ACTION',      value: '$.action'],
         [key: 'MERGED',      value: '$.pull_request.merged']
       ],
       causeString: 'Triggered by GitHub Pull Request Webhook',
       token: 'my-secret-webhook-token',
-      printContributedVariables: true,
+      printContributedVariables: false,
       printPostContent: false,
-      silentResponse: false
+      silentResponse: true
     )
   }
 
   options {
     disableConcurrentBuilds()
     timestamps()
+    ansiColor('xterm')
   }
 
   environment {
@@ -44,11 +43,20 @@ pipeline {
     stage('Prepare Environment') {
       steps {
         sh '''
-          # create venv and install deps
-          python3 -m venv .venv || python -m venv .venv
-          . .venv/bin/activate
-          pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; else pip install requests python-dotenv jq || true; fi
+          bash -lc '
+            set -euo pipefail
+            # create venv & install deps (if needed)
+            if [ ! -d .venv ]; then
+              python3 -m venv .venv || python -m venv .venv
+            fi
+            . .venv/bin/activate
+            pip install --upgrade pip || true
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt || true
+            else
+              pip install requests python-dotenv jq || true
+            fi
+          '
         '''
       }
     }
@@ -61,54 +69,46 @@ pipeline {
         script {
           echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot (dry-run)."
 
-          // Build OWNER/REPO from git remote if not provided via webhook (multibranch builds typically don't have them)
-          def ownerRepo = sh(script: "git config --get remote.origin.url | sed -E 's#.*[:/](.+)/(.+)\\.git\$#\\1/\\2#' || true", returnStdout: true).trim()
-          if (!ownerRepo) {
-            // fallback: try parsing GIT_URL env or repository info
-            ownerRepo = "${env.OWNER ?: ''}/${env.REPO ?: ''}"
-            ownerRepo = ownerRepo.trim().replaceAll('^/','').replaceAll('/$','')
-          }
-          if (!ownerRepo || ownerRepo == '/') {
-            echo "WARNING: Could not determine owner/repo from git remote or webhook. OWNER/REPO will be empty unless webhook provided them."
-          } else {
-            echo "Determined owner/repo: ${ownerRepo}"
-          }
-          def owner = ownerRepo.tokenize('/').size() >= 2 ? ownerRepo.tokenize('/')[0] : ''
-          def repo  = ownerRepo.tokenize('/').size() >= 2 ? ownerRepo.tokenize('/')[1] : ''
-
-          // Map PR-specific envs from multibranch vars (CHANGE_*)
-          def prNumber = env.CHANGE_ID ?: env.PR_NUMBER ?: ''
-          def headBranch = env.CHANGE_BRANCH ?: env.HEAD_BRANCH ?: ''
-          def baseBranch = env.CHANGE_TARGET ?: env.BASE_BRANCH ?: ''
-
-          if (!prNumber) {
-            error "PR number not available (CHANGE_ID/PR_NUMBER). Aborting PR diff stage."
-          }
-
-          echo "PR envs: OWNER='${owner}', REPO='${repo}', PR_NUMBER='${prNumber}', HEAD_BRANCH='${headBranch}', BASE_BRANCH='${baseBranch}'"
-
-          // Bind creds and run diff bot
           withCredentials([
             usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
-            // Export variables and call the Python diff bot
-            sh """
-              set -euo pipefail
-              . .venv/bin/activate
-              export GITHUB_USER='${GITHUB_USER}'
-              export GITHUB_TOKEN='${GITHUB_TOKEN}'
-              export TABLEAU_USER='${TABLEAU_USER}'
-              export TABLEAU_PW='${TABLEAU_PW}'
-              export DRY_RUN='${DRY_RUN_DEFAULT}'
-              export PR_NUMBER='${prNumber}'
-              export PR_SOURCE_BRANCH='${headBranch}'
-              export PR_TARGET_BRANCH='${baseBranch}'
-              export OWNER='${owner}'
-              export REPO='${repo}'
-              echo "Invoking ${TABLEAU_DIFF_PY} with OWNER=${owner}, REPO=${repo}, PR_NUMBER=${prNumber}, HEAD=${headBranch}, BASE=${baseBranch}"
-              python "${TABLEAU_DIFF_PY}"
-            """
+            // run everything under bash -lc so pipefail works and secrets are read from env
+            sh '''
+              bash -lc '
+                set -euo pipefail
+
+                # activate venv if exists
+                if [ -f .venv/bin/activate ]; then
+                  . .venv/bin/activate
+                fi
+
+                # Derive owner/repo from git remote (works for typical https/ssh remotes)
+                OWNER_REPO="$(git config --get remote.origin.url | sed -E "s#.*[:/](.+)/(.+)\\.git$#\\1/\\2#" || true)"
+                if [ -z "$OWNER_REPO" ]; then
+                  echo "WARNING: Could not derive OWNER/REPO from git remote; attempting to use webhook-mapped envs"
+                  OWNER="${OWNER:-}"
+                  REPO="${REPO:-}"
+                else
+                  OWNER="$(echo $OWNER_REPO | cut -d/ -f1)"
+                  REPO="$(echo $OWNER_REPO | cut -d/ -f2)"
+                fi
+
+                # Map Jenkins multibranch CHANGE_* envs into variables expected by python bot
+                export PR_NUMBER="${CHANGE_ID}"
+                export PR_SOURCE_BRANCH="${CHANGE_BRANCH}"
+                export PR_TARGET_BRANCH="${CHANGE_TARGET}"
+                export OWNER="${OWNER}"
+                export REPO="${REPO}"
+                export DRY_RUN="${DRY_RUN_DEFAULT}"
+
+                echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER} (head=${PR_SOURCE_BRANCH} base=${PR_TARGET_BRANCH})"
+
+                # secrets from withCredentials already exposed as env: GITHUB_USER, GITHUB_TOKEN, TABLEAU_USER, TABLEAU_PW
+                # Call python diff bot
+                python "${TABLEAU_DIFF_PY}"
+              '
+            '''
           } // withCredentials
         } // script
       } // steps
@@ -118,56 +118,68 @@ pipeline {
       when {
         allOf {
           expression { return env.BRANCH_NAME == 'main' }
-          expression { return env.CHANGE_ID == null || env.CHANGE_ID == '' } // not a PR build
+          expression { return env.CHANGE_ID == null || env.CHANGE_ID == '' } // ensure not a PR job
         }
       }
       steps {
         script {
-          echo "Main branch build detected. Checking if this commit is from a merged prod->main PR..."
-
-          // Determine owner/repo
-          def ownerRepo = sh(script: "git config --get remote.origin.url | sed -E 's#.*[:/](.+)/(.+)\\.git\$#\\1/\\2#' || true", returnStdout: true).trim()
-          if (!ownerRepo) {
-            error "Unable to determine owner/repo from git remote. Aborting deploy."
-          }
-          def (owner, repo) = ownerRepo.tokenize('/')
-
-          def sha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-          echo "Main commit ${sha} - querying GitHub for PRs associated with this commit..."
+          echo "Main branch build detected. Checking for associated merged prod->main PR..."
 
           withCredentials([
             usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
             usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
           ]) {
-            def apiCmd = """curl -s -H "Accept: application/vnd.github.groot-preview+json" \
- -H "Authorization: token ${GITHUB_TOKEN}" \
- "https://api.github.com/repos/${owner}/${repo}/commits/${sha}/pulls" """
+            sh '''
+              bash -lc '
+                set -euo pipefail
 
-            def prListJson = sh(script: apiCmd, returnStdout: true).trim()
-            if (!prListJson) {
-              error "GitHub API: empty response for commit ${sha}. Aborting deploy."
-            }
+                # Derive owner/repo from git remote
+                OWNER_REPO="$(git config --get remote.origin.url | sed -E "s#.*[:/](.+)/(.+)\\.git$#\\1/\\2#" || true)"
+                if [ -z "$OWNER_REPO" ]; then
+                  echo "ERROR: Cannot determine owner/repo from git remote. Aborting deploy."
+                  exit 1
+                fi
+                OWNER="$(echo $OWNER_REPO | cut -d/ -f1)"
+                REPO="$(echo $OWNER_REPO | cut -d/ -f2)"
 
-            def prNumber = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .number' | head -n1", returnStdout: true).trim()
-            def prTitle  = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .title' | head -n1", returnStdout: true).trim()
-            def prUser   = sh(script: "echo ${prListJson} | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .user.login' | head -n1", returnStdout: true).trim()
+                # current commit
+                SHA="$(git rev-parse HEAD)"
+                echo "Querying GitHub for PRs linked to commit $SHA..."
 
-            if (!prNumber) {
-              error "No merged PR from 'prod' found for commit ${sha}. Deployment only runs after a prod->main PR merge."
-            }
+                # Use GitHub API to list PRs for commit; requires PAT in GITHUB_TOKEN
+                PRS_JSON="$(curl -s -H \"Accept: application/vnd.github.groot-preview+json\" -H \"Authorization: token ${GITHUB_TOKEN}\" \"https://api.github.com/repos/${OWNER}/${REPO}/commits/${SHA}/pulls\")"
 
-            echo "Found merged PR #${prNumber} (title: ${prTitle}, author: ${prUser}) associated with commit ${sha}."
-            echo "Proceeding automatically to deploy (no manual approval)."
+                if [ -z \"$PRS_JSON\" ] || [ \"$PRS_JSON\" = \"null\" ]; then
+                  echo "ERROR: Empty response from GitHub for commit PR list. Aborting."
+                  exit 1
+                fi
 
-            sh """
-              chmod +x "${TABLEAU_SYNC_SCRIPT}" || true
-              export TABLEAU_USER="${TABLEAU_USER}"
-              export TABLEAU_PW="${TABLEAU_PW}"
-              export DRY_RUN="false"
-              export WORKSPACE="${WORKSPACE}"
-              echo "Invoking sync script: ${TABLEAU_SYNC_SCRIPT}"
-              "${TABLEAU_SYNC_SCRIPT}"
-            """
+                # find merged PR where head.ref == prod
+                PR_NUMBER="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .number' | head -n1 || true)"
+                PR_TITLE="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .title' | head -n1 || true)"
+                PR_USER="$(echo \"$PRS_JSON\" | jq -r '.[] | select(.head.ref==\"prod\" and .merged==true) | .user.login' | head -n1 || true)"
+
+                if [ -z \"$PR_NUMBER\" ] || [ \"$PR_NUMBER\" = \"null\" ]; then
+                  echo "No merged prod->main PR found for commit $SHA. Skipping deployment."
+                  exit 0
+                fi
+
+                echo "Found merged PR #${PR_NUMBER} (title: ${PR_TITLE}, author: ${PR_USER}). Proceeding to deploy."
+
+                # Run the Tableau sync script (real deploy)
+                if [ -f "${TABLEAU_SYNC_SCRIPT}" ]; then
+                  chmod +x "${TABLEAU_SYNC_SCRIPT}" || true
+                  export TABLEAU_USER="${TABLEAU_USER}"
+                  export TABLEAU_PW="${TABLEAU_PW}"
+                  export DRY_RUN="false"
+                  echo "Invoking ${TABLEAU_SYNC_SCRIPT}..."
+                  "${TABLEAU_SYNC_SCRIPT}"
+                else
+                  echo "ERROR: ${TABLEAU_SYNC_SCRIPT} not found in workspace. Aborting."
+                  exit 1
+                fi
+              '
+            '''
           } // withCredentials
         } // script
       } // steps
