@@ -69,10 +69,8 @@ fi
         script {
           echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot (local git diffs)."
 
-          withCredentials([
-            usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
-          ]) {
-            sh '''
+          // NOTE: we no longer require/use a GitHub API token in the Python bot.
+          sh '''
 /bin/bash -euo pipefail
 
 if [ -f .venv/bin/activate ]; then
@@ -104,13 +102,13 @@ export DRY_RUN="${DRY_RUN_DEFAULT}"
 
 echo "Running python diff bot: OWNER=${OWNER} REPO=${REPO} PR=${PR_NUMBER} head=${HEAD_BRANCH} base=${BASE_BRANCH}"
 
+# Ensure we have the base branch locally as origin/<base>
 if [ -n "${BASE_BRANCH}" ]; then
   git fetch origin +refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH} || true
 fi
 
 python "${TABLEAU_DIFF_PY}"
 '''
-          }
         }
       }
     }
@@ -127,7 +125,13 @@ python "${TABLEAU_DIFF_PY}"
           }
 
           def jsonText = readFile(file).trim()
-          def bodies = readJSON text: jsonText
+          if (!jsonText) {
+            error "${file} is empty"
+          }
+
+          // Use groovy.json.JsonSlurper instead of readJSON to avoid missing-step errors
+          def jsonSlurper = new groovy.json.JsonSlurper()
+          def bodies = jsonSlurper.parseText(jsonText)
 
           if (!(bodies instanceof List)) {
             error "${file} must be a JSON array of strings"
@@ -144,8 +148,10 @@ python "${TABLEAU_DIFF_PY}"
             def posted = false
             while (!posted && attempt < maxAttempts) {
               try {
-                def finalBody = body.replaceFirst(/(#tableau-diff-pr\\s+\\d+)/) { m -> return "${m[0]} — Part ${partIndex}/${total}" }
-                pullRequest.comment(finalBody)  // must be String
+                // replace the header tag once with a Part suffix (safe .replaceFirst on the string)
+                def finalBody = body.replaceFirst(/(#tableau-diff-pr\s+\d+)/) { m -> return "${m[0]} — Part ${partIndex}/${total}" }
+                // IMPORTANT: call pullRequest.comment with a String only
+                pullRequest.comment(finalBody)
                 echo "Posted comment part ${partIndex}/${total}"
                 posted = true
               } catch (err) {
