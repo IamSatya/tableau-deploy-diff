@@ -1,207 +1,114 @@
 pipeline {
-  agent any
+    agent any
 
-  triggers {
-    GenericTrigger(
-      genericVariables: [
-        [key: 'ACTION',      value: '$.action'],
-        [key: 'PR_NUMBER',   value: '$.pull_request.number'],
-        [key: 'HEAD_BRANCH', value: '$.pull_request.head.ref'],
-        [key: 'BASE_BRANCH', value: '$.pull_request.base.ref'],
-        [key: 'MERGED',      value: '$.pull_request.merged']
-      ],
-      causeString: 'Triggered by GitHub Pull Request Webhook',
-      token: 'my-secret-webhook-token',
-      printContributedVariables: false,
-      printPostContent: false,
-      silentResponse: true
-    )
-  }
-
-  options {
-    disableConcurrentBuilds()
-    timestamps()
-    ansiColor('xterm')
-  }
-
-  environment {
-    TABLEAU_SYNC_SCRIPT = 'scripts/tableau_sync.sh'
-    TABLEAU_DIFF_PY     = 'tableau_diff_bot.py'
-    DRY_RUN_DEFAULT     = 'true'
-  }
-
-  stages {
-    stage('Checkout') {
-      steps {
-        echo "Branch: ${env.BRANCH_NAME}  CHANGE_ID=${env.CHANGE_ID} CHANGE_TARGET=${env.CHANGE_TARGET} CHANGE_BRANCH=${env.CHANGE_BRANCH}"
-        checkout scm
-      }
+    environment {
+        VENV_DIR = '.venv'
     }
 
-    stage('Prepare Environment') {
-      steps {
-        sh '''
-/bin/bash -e <<'BASH'
-set -euo pipefail
-
-if [ ! -d .venv ]; then
-  python3 -m venv .venv || python -m venv .venv
-fi
-. .venv/bin/activate
-
-pip install --upgrade pip || true
-if [ -f requirements.txt ]; then
-  pip install -r requirements.txt || true
-else
-  pip install requests python-dotenv jq || true
-fi
-BASH
-'''
-      }
-    }
-
-    stage('PR: Run Tableau Diff Bot') {
-      when {
-        expression { return env.CHANGE_ID != null && env.CHANGE_ID != '' }
-      }
-      steps {
-        script {
-          echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot (dry-run)."
-
-          withCredentials([
-            usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
-            usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
-          ]) {
-            sh '''
-/bin/bash -e <<'BASH'
-set -euo pipefail
-
-if [ -f .venv/bin/activate ]; then
-  . .venv/bin/activate
-fi
-
-# derive owner/repo
-GIT_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
-OWNER=""
-REPO=""
-if [ -n "$GIT_URL" ]; then
-  CLEAN_URL="${GIT_URL%.git}"
-  OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' '{print $(NF-1) "/" $NF}')"
-  if [ -n "$OWNER_REPO" ]; then
-    OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
-    REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
-  fi
-fi
-
-export OWNER="${OWNER}"
-export REPO="${REPO}"
-export PR_NUMBER="${CHANGE_ID}"
-export HEAD_BRANCH="${CHANGE_BRANCH}"
-export BASE_BRANCH="${CHANGE_TARGET}"
-export DRY_RUN="${DRY_RUN_DEFAULT}"
-
-echo "Running diff bot for ${OWNER}/${REPO} PR ${PR_NUMBER}"
-python "${TABLEAU_DIFF_PY}"
-BASH
-'''
-          }
-        }
-      }
-    }
-
-    stage('PR: Post Diff Comments') {
-      when {
-        expression { return env.CHANGE_ID != null && env.CHANGE_ID != '' }
-      }
-      steps {
-        script {
-          def fileText = readFile('diffs.txt')
-          def comments = []
-          def current = []
-          fileText.split('\n').each { line ->
-            if (line.startsWith('---COMMENT_PART_')) {
-              current = []
-            } else if (line.startsWith('---END_COMMENT_PART---')) {
-              comments << current.join('\n')
-            } else {
-              current << line
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Branch: ${env.BRANCH_NAME}  CHANGE_ID=${env.CHANGE_ID} CHANGE_TARGET=${env.CHANGE_TARGET} CHANGE_BRANCH=${env.CHANGE_BRANCH}"
+                checkout scm
             }
-          }
+        }
 
-          comments.eachWithIndex { c, idx ->
-            retry(3) {
-              try {
-                pullRequest.comment(body: c)
-              } catch (err) {
-                echo "❌ Failed to post comment part ${idx+1}, retrying: ${err}"
-                sleep time: (5 * (idx+1)), unit: 'SECONDS'
-                throw err
-              }
+        stage('Prepare Environment') {
+            steps {
+                sh '''
+                  python3 -m venv ${VENV_DIR}
+                  . ${VENV_DIR}/bin/activate
+                  pip install --upgrade pip
+                  pip install requests python-dotenv jq
+                '''
             }
-          }
         }
-      }
-    }
 
-    stage('Deploy to Tableau (main - automatic on prod->main PR merge)') {
-      when {
-        allOf {
-          expression { return env.BRANCH_NAME == 'main' }
-          expression { return env.CHANGE_ID == null || env.CHANGE_ID == '' }
+        stage('PR: Run Tableau Diff Bot') {
+            when { changeRequest() }
+            steps {
+                script {
+                    echo "PR build detected (PR #${env.CHANGE_ID}) targeting '${env.CHANGE_TARGET}' -> running diff bot."
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                        sh """
+                          . ${VENV_DIR}/bin/activate
+                          OWNER=IamSatya \
+                          REPO=tableau-deploy-diff \
+                          PR_NUMBER=${env.CHANGE_ID} \
+                          HEAD_BRANCH=${env.CHANGE_BRANCH} \
+                          BASE_BRANCH=${env.CHANGE_TARGET} \
+                          GITHUB_TOKEN=${GITHUB_TOKEN} \
+                          python3 tableau_diff_bot.py > diffbot.log 2>&1 || true
+                        """
+                    }
+                }
+            }
         }
-      }
-      steps {
-        script {
-          echo "Main branch build detected. Checking for associated merged prod->main PR..."
 
-          withCredentials([
-            usernamePassword(credentialsId: 'github-token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN'),
-            usernamePassword(credentialsId: 'tableau-cred', usernameVariable: 'TABLEAU_USER', passwordVariable: 'TABLEAU_PW')
-          ]) {
-            sh '''
-/bin/bash -e <<'BASH'
-set -euo pipefail
+        stage('PR: Post Diff Comments') {
+            when { changeRequest() }
+            steps {
+                script {
+                    def fileContent = readFile('diffs.txt')
+                    def parts = fileContent.split(/(?m)^---COMMENT_PART_\d+---$/)
+                    def maxRetries = 3
 
-GIT_URL="$(git config --get remote.origin.url 2>/dev/null || true)"
-CLEAN_URL="${GIT_URL%.git}"
-OWNER_REPO="$(echo "$CLEAN_URL" | awk -F'[:/]' '{print $(NF-1) "/" $NF}')"
-OWNER="$(echo "$OWNER_REPO" | cut -d'/' -f1)"
-REPO="$(echo "$OWNER_REPO" | cut -d'/' -f2)"
-
-SHA="$(git rev-parse HEAD)"
-PRS_JSON="$(curl -s -H "Accept: application/vnd.github.groot-preview+json" -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${OWNER}/${REPO}/commits/${SHA}/pulls")"
-
-PR_NUMBER="$(echo "$PRS_JSON" | jq -r '.[] | select(.head.ref=="prod" and .merged==true) | .number' | head -n1 || true)"
-if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
-  echo "No merged prod->main PR found. Skipping deployment."
-  exit 0
-fi
-
-if [ -f "${TABLEAU_SYNC_SCRIPT}" ]; then
-  chmod +x "${TABLEAU_SYNC_SCRIPT}" || true
-  export TABLEAU_USER="${TABLEAU_USER}"
-  export TABLEAU_PW="${TABLEAU_PW}"
-  export DRY_RUN="false"
-  "${TABLEAU_SYNC_SCRIPT}"
-else
-  echo "ERROR: ${TABLEAU_SYNC_SCRIPT} not found."
-  exit 1
-fi
-BASH
-'''
-          }
+                    for (int i = 0; i < parts.size(); i++) {
+                        def body = parts[i].trim()
+                        if (body) {
+                            def attempt = 0
+                            def posted = false
+                            while (attempt < maxRetries && !posted) {
+                                try {
+                                    echo "📢 Posting PR comment part ${i + 1}/${parts.size()}"
+                                    pullRequest.comment(body)   // ✅ Correct usage: String only
+                                    posted = true
+                                } catch (Exception e) {
+                                    attempt++
+                                    echo "❌ Failed to post comment part ${i + 1}, attempt ${attempt}: ${e}"
+                                    if (attempt < maxRetries) {
+                                        sleep(time: 5 * attempt, unit: 'SECONDS') // exponential backoff
+                                    } else {
+                                        error "Failed to post PR comment after ${maxRetries} attempts"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-      }
-    }
-  }
 
-  post {
-    success {
-      echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME} (CHANGE_ID=${env.CHANGE_ID})"
+        stage('Deploy to Tableau (main - automatic on prod->main PR merge)') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { env.CHANGE_TARGET == 'main' && env.CHANGE_BRANCH == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'tableau-cred',
+                                                      usernameVariable: 'TABLEAU_USER',
+                                                      passwordVariable: 'TABLEAU_PW')]) {
+                        sh '''
+                          . ${VENV_DIR}/bin/activate
+                          chmod +x scripts/tableau_sync.sh
+                          ./scripts/tableau_sync.sh
+                        '''
+                    }
+                }
+            }
+        }
     }
-    failure {
-      echo "❌ Pipeline failed for branch ${env.BRANCH_NAME} (CHANGE_ID=${env.CHANGE_ID})"
+
+    post {
+        failure {
+            echo "❌ Pipeline failed for branch ${env.BRANCH_NAME} (CHANGE_ID=${env.CHANGE_ID})"
+        }
+        success {
+            echo "✅ Pipeline succeeded for branch ${env.BRANCH_NAME}"
+        }
     }
-  }
 }
 
